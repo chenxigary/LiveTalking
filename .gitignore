@@ -10,6 +10,7 @@ trial*/
 data
 data_utils/face_tracking/3DMM/*
 data_utils/face_parsing/79999_iter.pth
+avatars/wav2lip/face_detection/detection/sfd/s3fd.pth
 
 pretrained
 *.mp4

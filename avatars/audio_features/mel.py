@@ -33,17 +33,11 @@ class MelASR(BaseASR):
 
     def run_step(self):
         ############################################## extract audio feature ##############################################
-        # get a frame of audio
-        for _ in range(self.batch_size*2):
-            audioframe = self.get_audio_frame()
-            self.frames.append(audioframe.data)
-            # put to output
-            self.output_queue.put(audioframe)
-        # context not enough, do not run network.
-        if len(self.frames) <= self.stride_left_size + self.stride_right_size:
+        generation, inputs, _ = self.collect_step_audio(self.batch_size * 2)
+        # context not enough, or an interrupt changed generation.
+        if inputs is None:
             return
-        
-        inputs = np.concatenate(self.frames) # [N * chunk]
+
         mel = audio.melspectrogram(inputs)
         #print(mel.shape[0],mel.shape,len(mel[0]),len(self.frames))
         # cut off stride
@@ -61,7 +55,4 @@ class MelASR(BaseASR):
             else:
                 mel_chunks.append(mel[:, start_idx : start_idx + mel_step_size])
             i += 1
-        self.feat_queue.put(mel_chunks)
-        
-        # discard the old part to save memory
-        self.frames = self.frames[-(self.stride_left_size + self.stride_right_size):]
+        self.publish_step_feature(mel_chunks, generation)

@@ -48,6 +48,11 @@ from registry import register
 device = initialize_device()
 logger.info('Using {} for inference.'.format(device))
 
+# The bundled wav2lip256 checkpoint has a fixed 256x256 visual input.  Older
+# avatar generators defaulted to 96, so normalise legacy assets at load time
+# instead of letting the model fail deep inside its encoder.
+WAV2LIP_INPUT_SIZE = 256
+
 def _load(checkpoint_path):
     if device == 'cuda':
         checkpoint = torch.load(checkpoint_path)
@@ -77,15 +82,41 @@ def load_avatar(avatar_id):
     
     with open(coords_path, 'rb') as f:
         coord_list_cycle = pickle.load(f)
-    frame_list_cycle = None
-    input_img_list = glob.glob(os.path.join(full_imgs_path, '*.[jpJP][pnPN]*[gG]'))
-    input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-    frame_list_cycle = read_imgs(input_img_list)
-    input_face_list = glob.glob(os.path.join(face_imgs_path, '*.[jpJP][pnPN]*[gG]'))
-    input_face_list = sorted(input_face_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-    face_list_cycle = read_imgs(input_face_list)
 
-    return frame_list_cycle,face_list_cycle,coord_list_cycle
+    input_img_list = sorted(
+        glob.glob(os.path.join(full_imgs_path, '*.[jpJP][pnPN]*[gG]')),
+        key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
+    )
+    # Decode once at startup.  Keeping PNG bytes saved memory but forced a
+    # full 890x1920 PNG decode for every 25-fps idle frame, consuming roughly
+    # two CPU cores and starving local LLM/TTS on Apple Silicon.  This machine
+    # has enough unified memory for the ~0.7 GB decoded frame cycle.
+    frame_list_cycle = read_imgs(input_img_list)
+
+    input_face_list = sorted(
+        glob.glob(os.path.join(face_imgs_path, '*.[jpJP][pnPN]*[gG]')),
+        key=lambda x: int(os.path.splitext(os.path.basename(x))[0])
+    )
+    face_list_cycle = read_imgs(input_face_list)
+    legacy_sizes = {tuple(frame.shape[:2]) for frame in face_list_cycle}
+    if legacy_sizes != {(WAV2LIP_INPUT_SIZE, WAV2LIP_INPUT_SIZE)}:
+        logger.warning(
+            "Resizing Wav2Lip face assets from %s to %dx%d; regenerate the "
+            "avatar at 256 for best quality",
+            sorted(legacy_sizes),
+            WAV2LIP_INPUT_SIZE,
+            WAV2LIP_INPUT_SIZE,
+        )
+        face_list_cycle = [
+            cv2.resize(
+                frame,
+                (WAV2LIP_INPUT_SIZE, WAV2LIP_INPUT_SIZE),
+                interpolation=cv2.INTER_LANCZOS4,
+            )
+            for frame in face_list_cycle
+        ]
+
+    return frame_list_cycle, face_list_cycle, coord_list_cycle
 
 @torch.no_grad()
 def warm_up(batch_size,model,modelres):
@@ -138,11 +169,15 @@ class LipReal(BaseAvatar):
         pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.
         return pred
 
-    def paste_back_frame(self,pred_frame,idx:int):
+    def paste_back_frame(self, pred_frame, idx: int):
         bbox = self.coord_list_cycle[idx]
-        combine_frame = self.frame_list_cycle[idx].copy()
+        raw_frame = self.frame_list_cycle[idx]
+        if isinstance(raw_frame, bytes):
+            combine_frame = cv2.imdecode(np.frombuffer(raw_frame, np.uint8), cv2.IMREAD_COLOR)
+        else:
+            combine_frame = raw_frame.copy()
+
         y1, y2, x1, x2 = bbox
-        res_frame = cv2.resize(pred_frame.astype(np.uint8),(x2-x1,y2-y1))
+        res_frame = cv2.resize(pred_frame.astype(np.uint8), (x2 - x1, y2 - y1))
         combine_frame[y1:y2, x1:x2] = res_frame
         return combine_frame
-

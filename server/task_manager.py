@@ -104,7 +104,7 @@ class TaskManager:
                     video_path=task.params['video_path'],
                     avatar_id=task.avatar_id,
                     save_path=task.params.get('save_path', './data/avatars'),
-                    img_size=task.params.get('img_size', 96),
+                    img_size=task.params.get('img_size', 256),
                     pads=task.params.get('pads', [0, 10, 0, 0]),
                     nosmooth=task.params.get('nosmooth', False),
                     face_det_batch_size=task.params.get('face_det_batch_size', 16),

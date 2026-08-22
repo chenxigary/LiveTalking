@@ -63,11 +63,15 @@ class RTCManager:
 
         # 设置编解码器偏好
         capabilities = RTCRtpSender.getCapabilities("video")
-        preferences = list(filter(lambda x: x.name == "H264", capabilities.codecs))
-        preferences += list(filter(lambda x: x.name == "VP8", capabilities.codecs))
-        preferences += list(filter(lambda x: x.name == "rtx", capabilities.codecs))
-        transceiver = pc.getTransceivers()[1]
-        transceiver.setCodecPreferences(preferences)
+        if capabilities and hasattr(capabilities, "codecs"):
+            get_name = lambda c: getattr(c, "name", "") or getattr(c, "mimeType", "")
+            preferences = [c for c in capabilities.codecs if "H264" in get_name(c)]
+            preferences += [c for c in capabilities.codecs if "VP8" in get_name(c)]
+            preferences += [c for c in capabilities.codecs if "rtx" in get_name(c)]
+            transceivers = pc.getTransceivers()
+            video_transceiver = next((t for t in transceivers if t.kind == "video"), None)
+            if video_transceiver:
+                video_transceiver.setCodecPreferences(preferences)
 
         await pc.setRemoteDescription(offer)
         answer = await pc.createAnswer()

@@ -30,7 +30,7 @@ GET /api/admin/config
       "avatar_id": "wav2lip256_avatar1",
       "data_path": "data/avatars",
       "batch_size": 16,
-      "modelres": 192,
+      "modelres": 256,
       "modelfile": "",
       "customvideo_config": "",
       "tts": "edgetts",
@@ -59,7 +59,7 @@ GET /api/admin/config
 | `avatar_id` | string | "wav2lip256_avatar1" | 默认 Avatar 标识 |
 | `data_path` | string | "data/avatars" | Avatar 数据目录 |
 | `batch_size` | int | 16 | 推理批大小 |
-| `modelres` | int | 192 | 模型分辨率 |
+| `modelres` | int | 256 | 模型分辨率 |
 | `modelfile` | string | "" | 自定义模型文件路径 |
 | `customvideo_config` | string | "" | 自定义动作 JSON 文件路径 |
 | `tts` | string | "edgetts" | TTS 插件 |
@@ -123,4 +123,3 @@ GET /api/admin/sessions
 | `customopt` | array | 自定义动作配置 |
 
 ---
-

@@ -63,7 +63,16 @@ def parse_args():
     parser.add_argument('--avatar_id', type=str, default='wav2lip256_avatar1',
                         help="avatar id in data/avatars")
     parser.add_argument('--batch_size', type=int, default=16, help="infer batch")
-    parser.add_argument('--modelres', type=int, default=192)
+    parser.add_argument(
+        '--inference_stride',
+        type=int,
+        default=1,
+        help=(
+            "reuse one inferred mouth pose for this many 25-fps output frames; "
+            "use 4 for real-time Wav2Lip on slower Apple GPUs"
+        ),
+    )
+    parser.add_argument('--modelres', type=int, default=256)
     parser.add_argument('--modelfile', type=str, default='')
 
     # ─── 自定义动作和多形象 ────────────────────────────────────────────

@@ -20,16 +20,57 @@ import numpy as np
 
 import queue
 from queue import Queue
+from threading import RLock
+from dataclasses import dataclass
+from typing import Any
 from numpy.typing import NDArray
 import torch.multiprocessing as mp
 
 from avatars.base_avatar import BaseAvatar,AudioFrameData
+from utils.logger import logger
+
+
+@dataclass(frozen=True)
+class GenerationBatch:
+    """A feature batch tagged at the point where it entered the pipeline."""
+
+    data: Any
+    generation: int
+
+
+class GenerationQueue(Queue):
+    """Queue that preserves the generation of feature batches."""
+
+    def __init__(self, owner: "BaseASR", maxsize: int = 0):
+        super().__init__(maxsize=maxsize)
+        self._owner = owner
+
+    def put(self, item, block=True, timeout=None):
+        if not isinstance(item, GenerationBatch):
+            item = GenerationBatch(item, self._owner.generation)
+        return super().put(item, block=block, timeout=timeout)
+
+    def get(self, block=True, timeout=None):
+        item = super().get(block=block, timeout=timeout)
+        return item.data if isinstance(item, GenerationBatch) else item
+
+    def get_with_generation(self, block=True, timeout=None) -> GenerationBatch:
+        item = super().get(block=block, timeout=timeout)
+        if isinstance(item, GenerationBatch):
+            return item
+        return GenerationBatch(item, self._owner.generation)
 
 
 class BaseASR:
     def __init__(self, opt, parent:BaseAvatar = None):
         self.opt = opt
         self.parent = parent
+
+        # flush_talk is called from an HTTP request while run_step is called
+        # by the render thread. BaseAvatar serializes those operations; this
+        # lock also protects direct ASR callers and generation reads.
+        self._state_lock = RLock()
+        self._generation = 0
 
         self.fps = opt.fps # 20 ms per frame
         self.sample_rate = 16000
@@ -43,35 +84,248 @@ class BaseASR:
         self.stride_left_size = opt.l
         self.stride_right_size = opt.r
         #self.context_size = 10
-        self.feat_queue = Queue(maxsize=2)
+        self.feat_queue = GenerationQueue(self, maxsize=2)
+
+        # Playback-side continuity telemetry.  Adapter queue depth only says
+        # whether HTTP uploads are pending; this state records the point that
+        # matters to the user: LiveTalking had an active speech turn but no
+        # 20ms input frame and therefore inserted silence.
+        self._continuity_turn_id: str | None = None
+        self._continuity_generation = 0
+        self._continuity_active = False
+        self._continuity_underflow_events = 0
+        self._continuity_inserted_silence_frames = 0
+        self._continuity_current_silence_frames = 0
+        self._continuity_max_silence_frames = 0
+        self._continuity_min_queue_frames: int | None = None
 
         #self.warm_up()
 
-    def flush_talk(self):
-        self.queue.queue.clear()
+    @property
+    def generation(self) -> int:
+        with self._state_lock:
+            return self._generation
 
-    def put_audio_frame(self,audio_chunk:NDArray[np.float32],datainfo:dict): #16khz 20ms pcm
-        self.queue.put(AudioFrameData(data=audio_chunk,type=0,userdata=datainfo))
+    @staticmethod
+    def _drain_queue(q: Queue) -> int:
+        """Drain a Queue through its public locking protocol."""
 
-    #return frame:audio pcm; type: 0-normal speak, 1-silence; eventpoint:custom event sync with audio
-    def get_audio_frame(self)->AudioFrameData:        
-        try:
-            if self.parent and self.parent.custom_audiotype>1: #播放自定义音频,优先播放完自定义动作,可以通过interrupt打断动作播放
-                frame = self.parent.get_custom_audio_stream(self.parent.custom_audiotype)
-                type = self.parent.custom_audiotype
-                return AudioFrameData(data=frame, type=type, userdata={})
+        drained = 0
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                return drained
             else:
+                drained += 1
+                try:
+                    q.task_done()
+                except ValueError:
+                    # Tolerate a legacy/custom queue without task tracking.
+                    pass
+
+    def _clear_pipeline_locked(self) -> None:
+        self._drain_queue(self.queue)
+        self._drain_queue(self.output_queue)
+        self._drain_queue(self.feat_queue)
+        self.frames.clear()
+        if hasattr(self, "last_is_silence"):
+            self.last_is_silence = True
+        self._continuity_active = False
+        self._continuity_current_silence_frames = 0
+
+    def _start_continuity_turn_locked(
+        self, turn_id: str | None, generation: int
+    ) -> None:
+        self._continuity_turn_id = turn_id
+        self._continuity_generation = generation
+        self._continuity_active = True
+        self._continuity_underflow_events = 0
+        self._continuity_inserted_silence_frames = 0
+        self._continuity_current_silence_frames = 0
+        self._continuity_max_silence_frames = 0
+        self._continuity_min_queue_frames = None
+
+    def continuity_snapshot(self) -> dict[str, Any]:
+        """Return actual playback queue/underflow metrics for diagnostics."""
+
+        with self._state_lock:
+            queue_frames = self.queue.qsize()
+            return {
+                "turn_id": self._continuity_turn_id,
+                "generation": self._continuity_generation,
+                "active": self._continuity_active,
+                "queue_frames": queue_frames,
+                "queued_audio_ms": queue_frames * 20,
+                "underflow_events": self._continuity_underflow_events,
+                "inserted_silence_ms": (
+                    self._continuity_inserted_silence_frames * 20
+                ),
+                "current_inserted_silence_ms": (
+                    self._continuity_current_silence_frames * 20
+                ),
+                "max_inserted_silence_ms": (
+                    self._continuity_max_silence_frames * 20
+                ),
+                "min_queued_audio_ms": (
+                    None
+                    if self._continuity_min_queue_frames is None
+                    else self._continuity_min_queue_frames * 20
+                ),
+            }
+
+    def set_generation(self, generation: int, *, clear: bool = False) -> bool:
+        """Move to a generation; reject older ones and optionally drain."""
+
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("generation must be an integer") from exc
+        if generation < 0:
+            raise ValueError("generation must be non-negative")
+
+        with self._state_lock:
+            if generation < self._generation:
+                return False
+            changed = generation != self._generation
+            self._generation = generation
+            if changed or clear:
+                self._clear_pipeline_locked()
+            return True
+
+    def flush_talk(self, generation: int | None = None) -> int:
+        """Invalidate current audio and clear every ASR-owned queue."""
+
+        with self._state_lock:
+            if generation is None:
+                target = self._generation + 1
+            else:
+                try:
+                    requested = int(generation)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("generation must be an integer") from exc
+                target = max(self._generation, requested)
+            self._generation = target
+            self._clear_pipeline_locked()
+            return target
+
+    def _metadata_generation(self, datainfo: dict | None) -> int:
+        value = (datainfo or {}).get("generation")
+        if value is None or value == "":
+            return self.generation
+        try:
+            generation = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("generation must be an integer") from exc
+        if generation < 0:
+            raise ValueError("generation must be non-negative")
+        return generation
+
+    def put_audio_frame(self, audio_chunk: NDArray[np.float32], datainfo: dict | None = None): #16khz 20ms pcm
+        metadata = dict(datainfo or {})
+        generation = self._metadata_generation(metadata)
+        if not self.set_generation(generation, clear=generation > self.generation):
+            return False
+        metadata["generation"] = generation
+        with self._state_lock:
+            if generation != self._generation:
+                return False
+            self.queue.put(AudioFrameData(
+                data=audio_chunk,
+                type=0,
+                userdata=metadata,
+                generation=generation,
+            ))
+        return True
+
+    #return frame:audio pcm; type: 0-normal speak, 1-silence; eventpoint:custom event sync with audio
+    def get_audio_frame(self)->AudioFrameData:
+        while True:
+            try:
+                if self.parent and self.parent.custom_audiotype>1: #播放自定义音频,优先播放完自定义动作,可以通过interrupt打断动作播放
+                    frame = self.parent.get_custom_audio_stream(self.parent.custom_audiotype)
+                    type = self.parent.custom_audiotype
+                    current = self.generation
+                    return AudioFrameData(
+                        data=frame,
+                        type=type,
+                        userdata={"generation": current},
+                        generation=current,
+                    )
                 frame = self.queue.get(block=True,timeout=0.01)
+                try:
+                    self.queue.task_done()
+                except ValueError:
+                    pass
+                current = self.generation
+                if frame.generation < current:
+                    continue
+                if frame.generation > current:
+                    self.set_generation(frame.generation, clear=True)
+                    continue
+                metadata = frame.userdata if isinstance(frame.userdata, dict) else {}
+                status = metadata.get("status")
+                turn_id_value = metadata.get("turn_id")
+                turn_id = None if turn_id_value is None else str(turn_id_value)
+                with self._state_lock:
+                    if status in {"start", "start_end"}:
+                        self._start_continuity_turn_locked(turn_id, current)
+                    if self._continuity_active:
+                        queue_frames = self.queue.qsize()
+                        if (
+                            self._continuity_min_queue_frames is None
+                            or queue_frames < self._continuity_min_queue_frames
+                        ):
+                            self._continuity_min_queue_frames = queue_frames
+                        if self._continuity_current_silence_frames:
+                            recovered_ms = (
+                                self._continuity_current_silence_frames * 20
+                            )
+                            logger.info(
+                                "audio queue recovered: turn=%s generation=%s silence=%dms queued=%dms",
+                                self._continuity_turn_id,
+                                self._continuity_generation,
+                                recovered_ms,
+                                queue_frames * 20,
+                            )
+                            self._continuity_current_silence_frames = 0
+                    if status in {"end", "start_end"}:
+                        self._continuity_active = False
                 return frame
-            #print(f'[INFO] get frame {frame.shape}')
-        except queue.Empty:
-            frame = np.zeros(self.chunk, dtype=np.float32)
-            return AudioFrameData(data=frame, type=1, userdata={})
+            except queue.Empty:
+                current = self.generation
+                with self._state_lock:
+                    if self._continuity_active:
+                        if self._continuity_current_silence_frames == 0:
+                            self._continuity_underflow_events += 1
+                            logger.warning(
+                                "audio queue underflow: turn=%s generation=%s queued=0ms",
+                                self._continuity_turn_id,
+                                self._continuity_generation,
+                            )
+                        self._continuity_current_silence_frames += 1
+                        self._continuity_inserted_silence_frames += 1
+                        self._continuity_max_silence_frames = max(
+                            self._continuity_max_silence_frames,
+                            self._continuity_current_silence_frames,
+                        )
+                frame = np.zeros(self.chunk, dtype=np.float32)
+                return AudioFrameData(
+                    data=frame,
+                    type=1,
+                    userdata={"generation": current},
+                    generation=current,
+                )
 
 
     #return frame:audio pcm; type: 0-normal speak, 1-silence; eventpoint:custom event sync with audio
-    def get_audio_out(self)->AudioFrameData: 
-        return self.output_queue.get()
+    def get_audio_out(self)->AudioFrameData:
+        frame = self.output_queue.get()
+        try:
+            self.output_queue.task_done()
+        except ValueError:
+            pass
+        return frame
     
     def warm_up(self):
         for _ in range(self.stride_left_size + self.stride_right_size):
@@ -79,13 +333,102 @@ class BaseASR:
             self.frames.append(audio_frame.data)
             self.output_queue.put(audio_frame)
         for _ in range(self.stride_left_size):
-            self.output_queue.get()
+            self.get_audio_out()
 
     def run_step(self):
         pass
 
-    def get_next_feat(self,block,timeout):        
-        return self.feat_queue.get(block,timeout)
+    def collect_step_audio(self, frame_count: int):
+        """Collect one render step without exposing partially mixed generations.
+
+        Audio acquisition intentionally happens without the Avatar pipeline
+        lock.  A WebRTC shutdown must be able to let inference consume its
+        bounded feature queue while the render loop is winding down.  The
+        generation checks make a concurrent interrupt discard the whole step.
+        """
+
+        generation = self.generation
+        audio_frames: list[AudioFrameData] = []
+        for _ in range(frame_count):
+            audio_frame = self.get_audio_frame()
+            if audio_frame.generation != generation:
+                return generation, None, []
+            audio_frames.append(audio_frame)
+
+        with self._state_lock:
+            if generation != self._generation:
+                return generation, None, []
+            self.frames.extend(frame.data for frame in audio_frames)
+            for audio_frame in audio_frames:
+                self.output_queue.put(audio_frame)
+            if len(self.frames) <= self.stride_left_size + self.stride_right_size:
+                return generation, None, audio_frames
+            inputs = np.concatenate(tuple(self.frames))
+        return generation, inputs, audio_frames
+
+    def publish_step_feature(self, feature_data, generation: int) -> bool:
+        """Publish an explicitly tagged batch, then trim matching context."""
+
+        self.feat_queue.put(GenerationBatch(feature_data, generation))
+        with self._state_lock:
+            if generation != self._generation:
+                return False
+            self.frames = self.frames[-(
+                self.stride_left_size + self.stride_right_size
+            ):]
+            return True
+
+    def get_feature_batch(self, block=True, timeout=None) -> GenerationBatch | None:
+        """Get one feature batch, dropping stale generations."""
+
+        try:
+            batch = self.feat_queue.get_with_generation(block, timeout)
+        except queue.Empty:
+            return None
+        try:
+            self.feat_queue.task_done()
+        except ValueError:
+            pass
+        if batch.generation != self.generation:
+            return None
+        return batch
+
+    def get_next_feat(self, block, timeout):
+        batch = self.get_feature_batch(block, timeout)
+        return None if batch is None else batch.data
+
+    def get_output_frame_for_generation(self, generation: int, timeout: float = 1.0):
+        """Consume one output frame only if it belongs to ``generation``."""
+
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        while True:
+            if self.generation != generation:
+                return None
+            wait = 0.05
+            if deadline is not None:
+                wait = min(wait, max(0.0, deadline - time.monotonic()))
+                if wait <= 0:
+                    return None
+            try:
+                frame = self.output_queue.get(timeout=wait)
+            except queue.Empty:
+                continue
+            try:
+                self.output_queue.task_done()
+            except ValueError:
+                pass
+            frame_generation = getattr(frame, "generation", self.generation)
+            if frame_generation < generation:
+                continue
+            if frame_generation > generation:
+                # Leave a future frame for the current generation's inference
+                # pass. The stock output queue is unbounded.
+                try:
+                    self.output_queue.put_nowait(frame)
+                except queue.Full:
+                    pass
+                return None
+            return frame
 
     #分割音频特征，子类调用
     def _get_sliced_feature(self, feature_array, 

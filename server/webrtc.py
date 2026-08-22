@@ -56,6 +56,8 @@ class PlayerStreamTrack(MediaStreamTrack):
         self.kind = kind
         self._player = player
         self._queue = queue.Queue(maxsize=100)
+        self._generation = 0
+        self._generation_lock = threading.RLock()
         self.timelist = [] #记录最近包的时间戳
         self.current_frame_count = 0
         if self.kind == 'video':
@@ -75,7 +77,15 @@ class PlayerStreamTrack(MediaStreamTrack):
                 #self._timestamp = (time.time()-self._start) * VIDEO_CLOCK_RATE
                 self._timestamp += int(VIDEO_PTIME * VIDEO_CLOCK_RATE)
                 self.current_frame_count += 1
-                wait = self._start + self.current_frame_count * VIDEO_PTIME - time.time()
+                target = self._start + self.current_frame_count * VIDEO_PTIME
+                now = time.time()
+                # Queue starvation must not be followed by a catch-up burst.
+                # Keep media PTS continuous but move the wall-clock pacing
+                # anchor forward after a missed output interval.
+                if now - target > VIDEO_PTIME:
+                    self._start += now - target
+                    target = now
+                wait = target - now
                 # wait = self.timelist[0] + len(self.timelist)*VIDEO_PTIME - time.time()               
                 if wait>0:
                     await asyncio.sleep(wait)
@@ -93,7 +103,12 @@ class PlayerStreamTrack(MediaStreamTrack):
                 #self._timestamp = (time.time()-self._start) * SAMPLE_RATE
                 self._timestamp += int(AUDIO_PTIME * SAMPLE_RATE)
                 self.current_frame_count += 1
-                wait = self._start + self.current_frame_count * AUDIO_PTIME - time.time()
+                target = self._start + self.current_frame_count * AUDIO_PTIME
+                now = time.time()
+                if now - target > AUDIO_PTIME:
+                    self._start += now - target
+                    target = now
+                wait = target - now
                 # wait = self.timelist[0] + len(self.timelist)*AUDIO_PTIME - time.time()
                 if wait>0:
                     await asyncio.sleep(wait)
@@ -128,7 +143,18 @@ class PlayerStreamTrack(MediaStreamTrack):
         #     else:
         while True:
             try:
-                frame, eventpoint = self._queue.get_nowait()
+                item = self._queue.get_nowait()
+                if len(item) == 3:
+                    frame, eventpoint, generation = item
+                else:
+                    frame, eventpoint = item
+                    generation = self.generation
+                try:
+                    self._queue.task_done()
+                except ValueError:
+                    pass
+                if generation < self.generation:
+                    continue
                 break
             except queue.Empty:
                 await asyncio.sleep(0.005)
@@ -153,13 +179,33 @@ class PlayerStreamTrack(MediaStreamTrack):
     
     def stop(self):
         super().stop()
-        # Drain & delete remaining frames
-        while not self._queue.empty():
-            item = self._queue.get_nowait()
-            del item
+        self.clear_queue()
         if self._player is not None:
             self._player._stop(self)
             self._player = None
+
+    @property
+    def generation(self) -> int:
+        with self._generation_lock:
+            return self._generation
+
+    def set_generation(self, generation: int) -> None:
+        with self._generation_lock:
+            self._generation = max(self._generation, int(generation))
+
+    def clear_queue(self) -> int:
+        drained = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return drained
+            else:
+                drained += 1
+                try:
+                    self._queue.task_done()
+                except ValueError:
+                    pass
 
 def player_worker_thread(
     quit_event,
@@ -184,20 +230,81 @@ class HumanPlayer:
         self.__video = PlayerStreamTrack(self, kind="video")
 
         self.__container = avatar_session
+        self.__generation_lock = threading.RLock()
+        self.__generation = int(getattr(avatar_session, "generation", 0))
+        self.__audio.set_generation(self.__generation)
+        self.__video.set_generation(self.__generation)
         if hasattr(self.__container, 'output'):
             self.__container.output._player = self
 
     def push_video(self, frame):
+        self.push_video_for_generation(frame, self.generation)
+
+    def push_video_for_generation(self, frame, generation: int):
+        if int(generation) != self.generation:
+            return
         from av import VideoFrame
         new_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-        self.__video._queue.put((new_frame, None))
+        self._put_bounded(self.__video._queue, (new_frame, None, int(generation)))
 
     def push_audio(self, frame, eventpoint=None):
         from av import AudioFrame
         new_frame = AudioFrame(format='s16', layout='mono', samples=frame.shape[0])
         new_frame.planes[0].update(frame.tobytes())
         new_frame.sample_rate = 16000
-        self.__audio._queue.put((new_frame, eventpoint))
+        metadata_generation = self.generation
+        if isinstance(eventpoint, dict) and eventpoint.get("generation") is not None:
+            try:
+                metadata_generation = int(eventpoint["generation"])
+            except (TypeError, ValueError):
+                metadata_generation = self.generation
+        if metadata_generation < self.generation:
+            return
+        self._put_bounded(
+            self.__audio._queue,
+            (new_frame, eventpoint, metadata_generation),
+        )
+
+    @property
+    def generation(self) -> int:
+        with self.__generation_lock:
+            return self.__generation
+
+    def set_generation(self, generation: int) -> None:
+        with self.__generation_lock:
+            self.__generation = max(self.__generation, int(generation))
+            current = self.__generation
+        self.__audio.set_generation(current)
+        self.__video.set_generation(current)
+
+    def clear_queues(self) -> None:
+        self.__audio.clear_queue()
+        self.__video.clear_queue()
+
+    @staticmethod
+    def _put_bounded(target: queue.Queue, item) -> None:
+        """Never let a slow WebRTC consumer block the render thread."""
+
+        try:
+            target.put_nowait(item)
+            return
+        except queue.Full:
+            pass
+        try:
+            target.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            try:
+                target.task_done()
+            except ValueError:
+                pass
+        try:
+            target.put_nowait(item)
+        except queue.Full:
+            # A concurrent producer won the single available slot; dropping
+            # this frame is preferable to stalling the avatar pipeline.
+            pass
 
     def get_buffer_size(self) -> int:
         return self.__video._queue.qsize()
@@ -232,6 +339,9 @@ class HumanPlayer:
                     self.__thread_quit,
                     self.__container
                 ),
+                # A broken third-party inference backend must never keep the
+                # whole local server alive after its WebRTC session is gone.
+                daemon=True,
             )
             self.__thread.start()
 
@@ -241,12 +351,30 @@ class HumanPlayer:
         if not self.__started and self.__thread is not None:
             self.__log_debug("Stopping worker thread")
             self.__thread_quit.set()
-            self.__thread.join()
+            worker = self.__thread
             self.__thread = None
+            # aiortc invokes track.stop() on the aiohttp event-loop thread.
+            # Joining the renderer here freezes every HTTP/static route while
+            # Wav2Lip winds down (or forever if a backend is stuck).  Reap it
+            # off-loop with a bounded daemon waiter instead.
+            threading.Thread(
+                name="media-player-reaper",
+                target=self._reap_worker,
+                args=(worker,),
+                daemon=True,
+            ).start()
 
         if not self.__started and self.__container is not None:
             #self.__container.close()
             self.__container = None
+
+    @staticmethod
+    def _reap_worker(worker: threading.Thread) -> None:
+        worker.join(timeout=5.0)
+        if worker.is_alive():
+            mylogger.warning(
+                "HumanPlayer worker did not stop within 5s; detached daemon thread"
+            )
 
     def __log_debug(self, msg: str, *args) -> None:
         mylogger.debug(f"HumanPlayer {msg}", *args)

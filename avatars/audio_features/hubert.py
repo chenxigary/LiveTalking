@@ -23,18 +23,12 @@ class HubertASR(BaseASR):
 
     def run_step(self):
         start_time = time.time()
-        
-        is_all_silence=True
-        for _ in range(self.batch_size * 2):
-            audio_frame = self.get_audio_frame()
-            if audio_frame.type==0:
-                is_all_silence=False  
-            self.frames.append(audio_frame.data)
-            self.output_queue.put(audio_frame)
-        
-        if len(self.frames) <= self.stride_left_size + self.stride_right_size:
+
+        generation, inputs, audio_frames = self.collect_step_audio(self.batch_size * 2)
+        if inputs is None:
             return
-        
+
+        is_all_silence = all(frame.type != 0 for frame in audio_frames)
         mel_chunks = self.batch_size*[np.zeros((10,1024),dtype=np.float32)]  # default empty feature for silence
         if not is_all_silence or not self.last_is_silence: 
             inputs = np.concatenate(self.frames)  # [N * chunk]
@@ -44,8 +38,9 @@ class HubertASR(BaseASR):
                                             audio_feat_win = self.audio_feat_length, start=self.stride_left_size/2,
                                             feature_idx_multiplier=2)
 
-        self.feat_queue.put(mel_chunks)
-        self.frames = self.frames[-(self.stride_left_size + self.stride_right_size):]
-        self.last_is_silence = is_all_silence
+        if self.publish_step_feature(mel_chunks, generation):
+            with self._state_lock:
+                if generation == self._generation:
+                    self.last_is_silence = is_all_silence
         #print(f"Processing audio costs {(time.time() - start_time) * 1000}ms")
         #return is_all_silence and self.last_is_silence

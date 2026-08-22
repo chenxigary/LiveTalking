@@ -53,7 +53,7 @@ class FaceAlignment:
 
         network_size = int(network_size)
 
-        if 'cuda' in device:
+        if 'cuda' in str(device):
             torch.backends.cudnn.benchmark = True
 
         # Get the face detector
@@ -62,6 +62,8 @@ class FaceAlignment:
         self.face_detector = face_detector_module.FaceDetector(device=device, verbose=verbose)
 
     def get_detections_for_batch(self, images):
+        if isinstance(images, list):
+            images = np.asarray(images)
         images = images[..., ::-1]
         detected_faces = self.face_detector.detect_from_batch(images.copy())
         results = []

@@ -11,11 +11,12 @@ from utils.logger import logger
 
 # ─── 路由工具函数 ──────────────────────────────────────────────────────────
 
-def json_ok(data=None):
+def json_ok(data=None, **extra):
     """返回成功 JSON 响应"""
     body = {"code": 0, "msg": "ok"}
     if data is not None:
         body["data"] = data
+    body.update(extra)
     return web.Response(
         content_type="application/json",
         text=json.dumps(body),
@@ -38,6 +39,72 @@ def get_session(request, sessionid: str):
     return session_manager.get_session(sessionid)
 
 
+def _request_header(request, name: str):
+    headers = getattr(request, "headers", {})
+    getter = getattr(headers, "get", None)
+    return getter(name) if getter else None
+
+
+def _optional_int(value, field: str):
+    if value is None or value == "":
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be an integer") from exc
+    if result < 0:
+        raise ValueError(f"{field} must be non-negative")
+    return result
+
+
+def _audio_metadata_from_headers(request) -> dict:
+    """Translate Xiaoman's optional packet headers to LiveTalking metadata."""
+
+    metadata = {}
+    turn_id = _request_header(request, "X-Xiaoman-Turn-ID")
+    generation = _request_header(request, "X-Xiaoman-Generation")
+    sequence = _request_header(request, "X-Xiaoman-Sequence")
+    first_sequence = _request_header(request, "X-Xiaoman-First-Seq")
+    last_sequence = _request_header(request, "X-Xiaoman-Last-Seq")
+    pts_ms = _request_header(request, "X-Xiaoman-PTS-MS")
+    start = _request_header(request, "X-Xiaoman-Start")
+    end = _request_header(request, "X-Xiaoman-End")
+    streaming = _request_header(request, "X-Xiaoman-Streaming")
+    if turn_id not in (None, ""):
+        metadata["turn_id"] = str(turn_id)
+    parsed_generation = _optional_int(generation, "X-Xiaoman-Generation")
+    parsed_sequence = _optional_int(sequence, "X-Xiaoman-Sequence")
+    parsed_first_sequence = _optional_int(first_sequence, "X-Xiaoman-First-Seq")
+    parsed_last_sequence = _optional_int(last_sequence, "X-Xiaoman-Last-Seq")
+    parsed_pts = _optional_int(pts_ms, "X-Xiaoman-PTS-MS")
+    if parsed_generation is not None:
+        metadata["generation"] = parsed_generation
+    if parsed_sequence is not None:
+        metadata["seq"] = parsed_sequence
+    if parsed_first_sequence is not None:
+        metadata["first_seq"] = parsed_first_sequence
+    elif parsed_sequence is not None:
+        metadata["first_seq"] = parsed_sequence
+    if parsed_last_sequence is not None:
+        metadata["last_seq"] = parsed_last_sequence
+    elif parsed_sequence is not None:
+        metadata["last_seq"] = parsed_sequence
+    if parsed_pts is not None:
+        metadata["pts_ms"] = parsed_pts
+    if start not in (None, ""):
+        metadata["start"] = str(start).strip().lower() in {"1", "true", "yes", "on"}
+    if end not in (None, ""):
+        metadata["end"] = str(end).strip().lower() in {"1", "true", "yes", "on"}
+    if streaming not in (None, ""):
+        metadata["streaming"] = str(streaming).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    return metadata
+
+
 # ─── 路由处理函数 ──────────────────────────────────────────────────────────
 
 async def human(request):
@@ -51,7 +118,7 @@ async def human(request):
             return json_error("session not found")
 
         if params.get('interrupt'):
-            avatar_session.flush_talk()
+            avatar_session.flush_talk(params.get('generation'))
 
         datainfo = {}
         if params.get('tts'):  # tts 参数透传（voice, emotion 等）
@@ -80,7 +147,7 @@ async def interrupt_talk(request):
         avatar_session = get_session(request, sessionid)
         if avatar_session is None:
             return json_error("session not found")
-        avatar_session.flush_talk()
+        avatar_session.flush_talk(params.get('generation'))
         return json_ok()
     except Exception as e:
         logger.exception('interrupt_talk exception:')
@@ -95,12 +162,17 @@ async def humanaudio(request):
         fileobj = form["file"]
         filebytes = fileobj.file.read()
 
-        datainfo = {}
+        datainfo = _audio_metadata_from_headers(request)
 
         avatar_session = get_session(request, sessionid)
         if avatar_session is None:
             return json_error("session not found")
-        avatar_session.put_audio_file(filebytes, datainfo)
+        # A stale packet is intentionally acknowledged.  The Adapter can
+        # safely continue uploading current packets while the old generation
+        # is being invalidated, and the public endpoint remains compatible.
+        accepted = avatar_session.put_audio_file(filebytes, datainfo)
+        if accepted is False and datainfo.get("end"):
+            return json_error("avatar rejected final audio packet", code=-2)
         return json_ok()
     except Exception as e:
         logger.exception('humanaudio exception:')
@@ -147,7 +219,15 @@ async def is_speaking(request):
     avatar_session = get_session(request, sessionid)
     if avatar_session is None:
         return json_error("session not found")
-    return json_ok(data=avatar_session.is_speaking())
+    continuity = None
+    asr = getattr(avatar_session, "asr", None)
+    snapshot = getattr(asr, "continuity_snapshot", None)
+    if callable(snapshot):
+        continuity = snapshot()
+    return json_ok(
+        data=avatar_session.is_speaking(),
+        continuity=continuity,
+    )
 
 async def sse_handler(request):
     """SSE 事件流，推送服务器状态更新到客户端"""

@@ -53,7 +53,15 @@ from typing import Dict
 from utils.logger import logger
 import copy
 import gc
+import faulthandler
+import signal
 from dotenv import load_dotenv
+
+# SIGUSR1 is a read-only diagnostic hook for stuck native/worker threads.  It
+# writes every Python stack to the existing Avatar log without terminating the
+# process, which is especially useful on macOS where WebRTC and MPS share one
+# long-running service.
+faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 
 app = Flask(__name__)
