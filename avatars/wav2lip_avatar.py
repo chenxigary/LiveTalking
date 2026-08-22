@@ -24,7 +24,6 @@ import numpy as np
 
 import os
 import time
-import cv2
 import glob
 import pickle
 
@@ -41,7 +40,7 @@ from avatars.base_avatar import BaseAvatar
 
 from tqdm import tqdm
 from utils.logger import logger
-from utils.image import read_imgs, mirror_index
+from utils.image import decode_bgr, read_imgs, mirror_index, resize_bgr
 from utils.device import initialize_device
 from registry import register
 
@@ -108,10 +107,10 @@ def load_avatar(avatar_id):
             WAV2LIP_INPUT_SIZE,
         )
         face_list_cycle = [
-            cv2.resize(
+            resize_bgr(
                 frame,
                 (WAV2LIP_INPUT_SIZE, WAV2LIP_INPUT_SIZE),
-                interpolation=cv2.INTER_LANCZOS4,
+                resample="lanczos",
             )
             for frame in face_list_cycle
         ]
@@ -173,11 +172,13 @@ class LipReal(BaseAvatar):
         bbox = self.coord_list_cycle[idx]
         raw_frame = self.frame_list_cycle[idx]
         if isinstance(raw_frame, bytes):
-            combine_frame = cv2.imdecode(np.frombuffer(raw_frame, np.uint8), cv2.IMREAD_COLOR)
+            combine_frame = decode_bgr(raw_frame)
         else:
             combine_frame = raw_frame.copy()
 
         y1, y2, x1, x2 = bbox
-        res_frame = cv2.resize(pred_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+        res_frame = resize_bgr(
+            pred_frame.astype(np.uint8), (x2 - x1, y2 - y1)
+        )
         combine_frame[y1:y2, x1:x2] = res_frame
         return combine_frame

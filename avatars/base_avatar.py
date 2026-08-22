@@ -25,7 +25,6 @@ import numpy as np
 import subprocess
 import os
 import time
-import cv2
 import glob
 import resampy
 import queue
@@ -46,7 +45,13 @@ from av import AudioFrame, VideoFrame
 from fractions import Fraction
 
 from utils.logger import logger
-from utils.image import read_imgs,mirror_index
+from utils.image import (
+    blend_bgr,
+    decode_bgr,
+    draw_debug_label_bgr,
+    mirror_index,
+    read_imgs,
+)
 
 # class State(Enum):
 #     INIT=0
@@ -646,10 +651,7 @@ class BaseAvatar:
         receiving raw ``bytes`` objects.
         """
         if isinstance(frame, (bytes, bytearray, memoryview)):
-            decoded = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if decoded is None:
-                raise ValueError("Unable to decode cached avatar video frame")
-            return decoded
+            return decode_bgr(bytes(frame))
         if isinstance(frame, np.ndarray):
             return frame.copy()
         array = np.asarray(frame)
@@ -848,7 +850,9 @@ class BaseAvatar:
                     # 说话→静音过渡
                     if time.time() - _transition_start < _transition_duration and _last_speaking_frame is not None:
                         alpha = min(1.0, (time.time() - _transition_start) / _transition_duration)
-                        combine_frame = cv2.addWeighted(_last_speaking_frame, 1-alpha, target_frame, alpha, 0)
+                        combine_frame = blend_bgr(
+                            _last_speaking_frame, 1 - alpha, target_frame, alpha
+                        )
                     else:
                         combine_frame = target_frame
                     # 缓存静音帧
@@ -866,7 +870,9 @@ class BaseAvatar:
                     # 静音→说话过渡
                     if time.time() - _transition_start < _transition_duration and _last_silent_frame is not None:
                         alpha = min(1.0, (time.time() - _transition_start) / _transition_duration)
-                        combine_frame = cv2.addWeighted(_last_silent_frame, 1-alpha, current_frame, alpha, 0)
+                        combine_frame = blend_bgr(
+                            _last_silent_frame, 1 - alpha, current_frame, alpha
+                        )
                     else:
                         combine_frame = current_frame
                     # 缓存说话帧
@@ -876,7 +882,7 @@ class BaseAvatar:
 
             if not self._generation_is_current(generation):
                 continue
-            cv2.putText(combine_frame, "LiveTalking", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (128,128,128), 1)
+            combine_frame = draw_debug_label_bgr(combine_frame)
             
             # 使用统一输出接口推送视频帧
             player = getattr(self.output, "_player", None)

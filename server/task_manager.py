@@ -4,7 +4,6 @@ import threading
 import json
 import os
 import requests
-import cv2
 from concurrent.futures import ThreadPoolExecutor
 from utils.logger import logger
 
