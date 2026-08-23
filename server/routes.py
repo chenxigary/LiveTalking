@@ -154,6 +154,23 @@ async def interrupt_talk(request):
         return json_error(str(e))
 
 
+async def close_session(request):
+    """Explicitly release a WebRTC session on client shutdown."""
+    try:
+        params = await request.json()
+        sessionid = str(params.get('sessionid', '')).strip()
+        if not sessionid:
+            return json_error("sessionid is required")
+        rtc_manager = request.app.get("rtc_manager")
+        if rtc_manager is None:
+            return json_error("RTC manager not found")
+        closed = await rtc_manager.close_session(sessionid)
+        return json_ok(data={"sessionid": sessionid, "closed": closed})
+    except Exception as e:
+        logger.exception('close_session exception:')
+        return json_error(str(e))
+
+
 async def humanaudio(request):
     """上传音频文件"""
     try:
@@ -329,6 +346,7 @@ def setup_routes(app):
     app.router.add_post("/set_audiotype", set_audiotype)
     app.router.add_post("/record", record)
     app.router.add_post("/interrupt_talk", interrupt_talk)
+    app.router.add_post("/api/session/close", close_session)
     app.router.add_post("/is_speaking", is_speaking)
     app.router.add_get("/api/admin/config", admin_config)
     app.router.add_get("/api/admin/sessions", admin_sessions)

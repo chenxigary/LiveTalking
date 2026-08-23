@@ -357,6 +357,7 @@
         updateStatus(false, "正在握手 WebRTC...");
 
         try {
+            if (pc) stop();
             resetAvatarSessionAnnouncement();
             const startPromise = start();
             if (pc) {
@@ -422,10 +423,12 @@
     window.addEventListener('pagehide', () => {
         stopAvatarEvents();
         postAvatarSession(false, true);
+        stop();
     });
     window.addEventListener('beforeunload', () => {
         stopAvatarEvents();
         postAvatarSession(false, true);
+        stop();
     });
 </script>
 </body>

@@ -102,29 +102,30 @@ function stop() {
     var stopEl = document.getElementById('stop');
     if (stopEl) stopEl.style.display = 'none';
 
+    var sidEl = document.getElementById('sessionid');
+    var sessionId = sidEl && sidEl.value ? String(sidEl.value).trim() : '';
+    if (sessionId && sessionId !== '0') {
+        var endpoint = ((window.location.origin && window.location.origin !== 'null')
+            ? window.location.origin : 'http://localhost:8010') + '/api/session/close';
+        var body = JSON.stringify({sessionid: sessionId});
+        if (navigator.sendBeacon) {
+            navigator.sendBeacon(endpoint, new Blob([body], {type: 'application/json'}));
+        } else {
+            fetch(endpoint, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: body,
+                keepalive: true,
+            }).catch(() => {});
+        }
+        sidEl.value = '0';
+    }
+
     if (pc) {
-        setTimeout(() => {
-            pc.close();
-        }, 500);
+        pc.close();
+        pc = null;
     }
 }
 
-window.onunload = function(event) {
-    // 在这里执行你想要的操作
-    setTimeout(() => {
-        pc.close();
-    }, 500);
-};
-
-window.onbeforeunload = function (e) {
-        setTimeout(() => {
-                pc.close();
-            }, 500);
-        e = e || window.event
-        // 兼容IE8和Firefox 4之前的版本
-        if (e) {
-          e.returnValue = '关闭提示'
-        }
-        // Chrome, Safari, Firefox 4+, Opera 12+ , IE 9+
-        return '关闭提示'
-      }
+window.addEventListener('pagehide', stop);
+window.addEventListener('beforeunload', stop);
