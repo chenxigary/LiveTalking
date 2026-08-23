@@ -1,4 +1,24 @@
 var pc = null;
+var sessionHeartbeatTimer = null;
+
+function stopSessionHeartbeat() {
+    if (sessionHeartbeatTimer !== null) {
+        clearInterval(sessionHeartbeatTimer);
+        sessionHeartbeatTimer = null;
+    }
+}
+
+function startSessionHeartbeat(sessionId) {
+    stopSessionHeartbeat();
+    var endpoint = ((window.location.origin && window.location.origin !== 'null')
+        ? window.location.origin : 'http://localhost:8010') + '/api/session/heartbeat';
+    var renew = () => fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({sessionid: sessionId}),
+    }).catch(() => {});
+    sessionHeartbeatTimer = setInterval(renew, 10000);
+}
 
 function negotiate() {
     pc.addTransceiver('video', { direction: 'recvonly' });
@@ -29,6 +49,7 @@ function negotiate() {
             body: JSON.stringify({
                 sdp: offer.sdp,
                 type: offer.type,
+                session_ttl_sec: 30,
             }),
             headers: {
                 'Content-Type': 'application/json'
@@ -43,6 +64,7 @@ function negotiate() {
     }).then((answer) => {
         var sidEl = document.getElementById('sessionid');
         if (sidEl) sidEl.value = answer.sessionid;
+        startSessionHeartbeat(String(answer.sessionid));
         return pc.setRemoteDescription(answer);
     });
 }
@@ -101,6 +123,7 @@ function start() {
 function stop() {
     var stopEl = document.getElementById('stop');
     if (stopEl) stopEl.style.display = 'none';
+    stopSessionHeartbeat();
 
     var sidEl = document.getElementById('sessionid');
     var sessionId = sidEl && sidEl.value ? String(sidEl.value).trim() : '';

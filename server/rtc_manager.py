@@ -42,6 +42,8 @@ class RTCManager:
         self._session_by_pc: Dict[RTCPeerConnection, str] = {}
         self._closing_pcs: set = set()
         self._disconnect_tasks: Dict[RTCPeerConnection, asyncio.Task] = {}
+        self._lease_tasks: Dict[str, asyncio.Task] = {}
+        self._lease_seconds: Dict[str, float] = {}
         self._disconnect_grace_sec = max(
             0.0, float(getattr(opt, "webrtc_disconnect_grace_sec", 10.0))
         )
@@ -51,6 +53,54 @@ class RTCManager:
         if task is not None and task is not asyncio.current_task():
             task.cancel()
 
+    def _cancel_lease(self, sessionid: str):
+        task = self._lease_tasks.pop(sessionid, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        self._lease_seconds.pop(sessionid, None)
+
+    @staticmethod
+    def _parse_session_ttl(params: dict) -> Optional[float]:
+        raw = params.get("session_ttl_sec")
+        if raw in (None, ""):
+            return None
+        try:
+            ttl = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session_ttl_sec must be a number") from exc
+        if not 5.0 <= ttl <= 86400.0:
+            raise ValueError("session_ttl_sec must be between 5 and 86400 seconds")
+        return ttl
+
+    def renew_session(self, sessionid: str, ttl_sec: Optional[float] = None) -> bool:
+        """Renew an opt-in client lease used when ICE teardown is not observable."""
+
+        pc = self._pcs_by_session.get(sessionid)
+        if pc is None:
+            return False
+        ttl = ttl_sec if ttl_sec is not None else self._lease_seconds.get(sessionid)
+        if ttl is None:
+            return False
+        ttl = float(ttl)
+        self._cancel_lease(sessionid)
+        self._lease_seconds[sessionid] = ttl
+
+        async def expire_lease():
+            try:
+                await asyncio.sleep(ttl)
+                if self._pcs_by_session.get(sessionid) is pc:
+                    await self._cleanup_pc(
+                        pc, sessionid, f"client lease expired after {ttl:g}s"
+                    )
+            except asyncio.CancelledError:
+                return
+            finally:
+                if self._lease_tasks.get(sessionid) is asyncio.current_task():
+                    self._lease_tasks.pop(sessionid, None)
+
+        self._lease_tasks[sessionid] = asyncio.create_task(expire_lease())
+        return True
+
     async def _cleanup_pc(self, pc, sessionid: str, reason: str) -> bool:
         """Idempotently close one peer and release its render session."""
 
@@ -58,6 +108,7 @@ class RTCManager:
             return False
         self._closing_pcs.add(pc)
         self._cancel_disconnect_cleanup(pc)
+        self._cancel_lease(sessionid)
         logger.info("Closing WebRTC session %s (%s)", sessionid, reason)
         try:
             if getattr(pc, "connectionState", None) != "closed":
@@ -95,7 +146,7 @@ class RTCManager:
 
         self._disconnect_tasks[pc] = asyncio.create_task(expire_disconnected())
 
-    def _register_pc(self, pc, sessionid: str):
+    def _register_pc(self, pc, sessionid: str, session_ttl_sec: Optional[float] = None):
         self.pcs.add(pc)
         self._pcs_by_session[sessionid] = pc
         self._session_by_pc[pc] = sessionid
@@ -117,13 +168,18 @@ class RTCManager:
         async def on_iceconnectionstatechange():
             await observe_state(pc.iceConnectionState, "ICE connection")
 
-    async def _create_pc_and_answer(self, avatar_session, sessionid, offer):
+        if session_ttl_sec is not None:
+            self.renew_session(sessionid, session_ttl_sec)
+
+    async def _create_pc_and_answer(
+        self, avatar_session, sessionid, offer, session_ttl_sec: Optional[float] = None
+    ):
         """创建 PeerConnection、添加轨道、SDP 交换，返回已完成 answer 的 pc"""
         ice_server = RTCIceServer(urls=self.opt.stun)
         pc = RTCPeerConnection(
             configuration=RTCConfiguration(iceServers=[ice_server])
         )
-        self._register_pc(pc, sessionid)
+        self._register_pc(pc, sessionid, session_ttl_sec)
 
         try:
             # 添加发送轨道
@@ -167,6 +223,14 @@ class RTCManager:
     async def handle_offer(self, request):
         """处理 WebRTC offer 信令"""
         params = await request.json()
+        try:
+            session_ttl_sec = self._parse_session_ttl(params)
+        except ValueError as exc:
+            return web.Response(
+                status=400,
+                content_type="application/json",
+                text=json.dumps({"code": -1, "msg": str(exc)}),
+            )
         offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
         try:
@@ -180,7 +244,7 @@ class RTCManager:
         logger.info('offer sessionid=%s', sessionid)
 
         pc = await self._create_pc_and_answer(
-            session_manager.get_session(sessionid), sessionid, offer
+            session_manager.get_session(sessionid), sessionid, offer, session_ttl_sec
         )
 
         return web.Response(
@@ -204,6 +268,10 @@ class RTCManager:
         params = dict(request.query)
         # 客户端可通过 query param 自定义 sessionid，不传则自动生成
         client_sid = params.pop("sessionid", None)
+        try:
+            session_ttl_sec = self._parse_session_ttl(params)
+        except ValueError as exc:
+            return web.Response(status=400, content_type="text/plain", text=str(exc))
 
         offer_sdp = await request.text()
         offer = RTCSessionDescription(sdp=offer_sdp, type="offer")
@@ -220,7 +288,7 @@ class RTCManager:
         logger.info("whep sessionid=%s", sessionid)
 
         pc = await self._create_pc_and_answer(
-            session_manager.get_session(sessionid), sessionid, offer
+            session_manager.get_session(sessionid), sessionid, offer, session_ttl_sec
         )
 
         return web.Response(
@@ -268,3 +336,7 @@ class RTCManager:
         for task in list(self._disconnect_tasks.values()):
             task.cancel()
         self._disconnect_tasks.clear()
+        for task in list(self._lease_tasks.values()):
+            task.cancel()
+        self._lease_tasks.clear()
+        self._lease_seconds.clear()

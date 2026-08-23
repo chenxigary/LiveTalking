@@ -171,6 +171,25 @@ async def close_session(request):
         return json_error(str(e))
 
 
+async def heartbeat_session(request):
+    """Renew an existing opt-in WebRTC session lease."""
+    try:
+        params = await request.json()
+        sessionid = str(params.get('sessionid', '')).strip()
+        if not sessionid:
+            return json_error("sessionid is required")
+        rtc_manager = request.app.get("rtc_manager")
+        if rtc_manager is None:
+            return json_error("RTC manager not found")
+        renewed = rtc_manager.renew_session(sessionid)
+        if not renewed:
+            return json_error("session not found or lease is not enabled")
+        return json_ok(data={"sessionid": sessionid, "renewed": True})
+    except Exception as e:
+        logger.exception('heartbeat_session exception:')
+        return json_error(str(e))
+
+
 async def humanaudio(request):
     """上传音频文件"""
     try:
@@ -347,6 +366,7 @@ def setup_routes(app):
     app.router.add_post("/record", record)
     app.router.add_post("/interrupt_talk", interrupt_talk)
     app.router.add_post("/api/session/close", close_session)
+    app.router.add_post("/api/session/heartbeat", heartbeat_session)
     app.router.add_post("/is_speaking", is_speaking)
     app.router.add_get("/api/admin/config", admin_config)
     app.router.add_get("/api/admin/sessions", admin_sessions)
