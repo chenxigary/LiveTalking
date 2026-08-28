@@ -58,6 +58,22 @@ class PlayerStreamTrack(MediaStreamTrack):
         self._queue = queue.Queue(maxsize=100)
         self._generation = 0
         self._generation_lock = threading.RLock()
+        self._continuity_lock = threading.RLock()
+        self._audio_continuity_armed = False
+        self._audio_speech_active = False
+        self._audio_fallback_events = 0
+        self._audio_fallback_frames = 0
+        self._audio_current_fallback_frames = 0
+        self._audio_max_fallback_frames = 0
+        self._audio_speech_fallback_events = 0
+        self._audio_speech_fallback_frames = 0
+        self._audio_current_speech_fallback_frames = 0
+        self._audio_max_speech_fallback_frames = 0
+        self._sender_timing_lock = threading.RLock()
+        self._sender_timing_frames = 0
+        self._sender_last_monotonic_ms = None
+        self._sender_last_media_ms = None
+        self._sender_gap_events = []
         self.timelist = [] #记录最近包的时间戳
         self.current_frame_count = 0
         if self.kind == 'video':
@@ -124,6 +140,7 @@ class PlayerStreamTrack(MediaStreamTrack):
             return self._timestamp, AUDIO_TIME_BASE
 
     async def recv(self) -> Union[Frame, Packet]:
+        recv_entry_monotonic_ms = time.monotonic_ns() / 1_000_000
         # frame = self.frames[self.counter % 30]            
         self._player._start(self)
         # if self.kind == 'video':
@@ -141,6 +158,7 @@ class PlayerStreamTrack(MediaStreamTrack):
         #         else:
         #             frame = await self._queue.get()
         #     else:
+        used_audio_fallback = False
         while True:
             try:
                 item = self._queue.get_nowait()
@@ -157,9 +175,36 @@ class PlayerStreamTrack(MediaStreamTrack):
                     continue
                 break
             except queue.Empty:
+                if self.kind == "audio" and self._audio_continuity_armed:
+                    samples = round(AUDIO_PTIME * SAMPLE_RATE)
+                    audio = np.zeros((1, samples), dtype=np.int16)
+                    frame = AudioFrame.from_ndarray(
+                        audio,
+                        layout="mono",
+                        format="s16",
+                    )
+                    frame.sample_rate = SAMPLE_RATE
+                    eventpoint = None
+                    generation = self.generation
+                    used_audio_fallback = True
+                    self._record_audio_fallback()
+                    break
                 await asyncio.sleep(0.005)
+
+        queue_ready_monotonic_ms = time.monotonic_ns() / 1_000_000
+
+        if self.kind == "audio" and not used_audio_fallback:
+            status = str(eventpoint.get("status", "")) if isinstance(eventpoint, dict) else ""
+            if status in {"start", "start_end"}:
+                with self._continuity_lock:
+                    self._audio_speech_active = True
+            self._record_real_audio_frame()
+            if status in {"end", "start_end"}:
+                with self._continuity_lock:
+                    self._audio_speech_active = False
                 
         pts, time_base = await self.next_timestamp()
+        pacing_done_monotonic_ms = time.monotonic_ns() / 1_000_000
         frame.pts = pts
         frame.time_base = time_base
         if eventpoint and self._player is not None:
@@ -175,7 +220,155 @@ class PlayerStreamTrack(MediaStreamTrack):
                 mylogger.info(f"------actual avg final fps:{self.framecount/self.totaltime:.4f}")
                 self.framecount = 0
                 self.totaltime=0
+        self._record_sender_timing(
+            pts,
+            time_base,
+            recv_entry_monotonic_ms=recv_entry_monotonic_ms,
+            queue_ready_monotonic_ms=queue_ready_monotonic_ms,
+            pacing_done_monotonic_ms=pacing_done_monotonic_ms,
+        )
         return frame
+
+    def _record_sender_timing(
+        self,
+        pts,
+        time_base,
+        *,
+        now_monotonic_ms=None,
+        recv_entry_monotonic_ms=None,
+        queue_ready_monotonic_ms=None,
+        pacing_done_monotonic_ms=None,
+    ) -> None:
+        """Record when a frame is handed back to aiortc's RTP sender.
+
+        ``time.monotonic_ns`` is system-wide on macOS, so a separate local
+        receiver can compare these intervals without wall-clock sync.  Keep
+        only the eight largest events to make the per-session snapshot bounded.
+        """
+
+        now_ms = (
+            time.monotonic_ns() / 1_000_000
+            if now_monotonic_ms is None
+            else float(now_monotonic_ms)
+        )
+        media_ms = float(pts * time_base * 1000)
+        recv_entry_ms = (
+            now_ms
+            if recv_entry_monotonic_ms is None
+            else float(recv_entry_monotonic_ms)
+        )
+        queue_ready_ms = (
+            recv_entry_ms
+            if queue_ready_monotonic_ms is None
+            else float(queue_ready_monotonic_ms)
+        )
+        pacing_done_ms = (
+            queue_ready_ms
+            if pacing_done_monotonic_ms is None
+            else float(pacing_done_monotonic_ms)
+        )
+        with self._sender_timing_lock:
+            self._sender_timing_frames += 1
+            if (
+                self._sender_last_monotonic_ms is not None
+                and self._sender_last_media_ms is not None
+            ):
+                wall_gap_ms = now_ms - self._sender_last_monotonic_ms
+                media_gap_ms = media_ms - self._sender_last_media_ms
+                event = {
+                    "gap_ms": wall_gap_ms,
+                    "media_gap_ms": media_gap_ms,
+                    "excess_gap_ms": wall_gap_ms - media_gap_ms,
+                    "start_monotonic_ms": self._sender_last_monotonic_ms,
+                    "end_monotonic_ms": now_ms,
+                    "inter_call_gap_ms": (
+                        recv_entry_ms - self._sender_last_monotonic_ms
+                    ),
+                    "queue_wait_ms": queue_ready_ms - recv_entry_ms,
+                    "pacing_wait_ms": pacing_done_ms - queue_ready_ms,
+                    "post_pacing_ms": now_ms - pacing_done_ms,
+                    "recv_total_ms": now_ms - recv_entry_ms,
+                }
+                self._sender_gap_events.append(event)
+                self._sender_gap_events.sort(
+                    key=lambda item: item["gap_ms"], reverse=True
+                )
+                del self._sender_gap_events[8:]
+            self._sender_last_monotonic_ms = now_ms
+            self._sender_last_media_ms = media_ms
+
+    def sender_timing_snapshot(self) -> dict:
+        expected_interval_ms = round(
+            (AUDIO_PTIME if self.kind == "audio" else VIDEO_PTIME) * 1000
+        )
+        with self._sender_timing_lock:
+            events = [dict(item) for item in self._sender_gap_events]
+            return {
+                "clock": "time.monotonic_ns",
+                "kind": self.kind,
+                "expected_interval_ms": expected_interval_ms,
+                "frames_returned": self._sender_timing_frames,
+                "gap_max_ms": None if not events else events[0]["gap_ms"],
+                "gap_events": events,
+            }
+
+    def _record_real_audio_frame(self) -> None:
+        with self._continuity_lock:
+            recovered_frames = self._audio_current_fallback_frames
+            recovered_speech_frames = self._audio_current_speech_fallback_frames
+            self._audio_continuity_armed = True
+            self._audio_current_fallback_frames = 0
+            self._audio_current_speech_fallback_frames = 0
+        if recovered_frames:
+            mylogger.info(
+                "WebRTC audio queue recovered after %dms fallback silence (%dms during speech)",
+                recovered_frames * round(AUDIO_PTIME * 1000),
+                recovered_speech_frames * round(AUDIO_PTIME * 1000),
+            )
+
+    def _record_audio_fallback(self) -> None:
+        with self._continuity_lock:
+            if self._audio_current_fallback_frames == 0:
+                self._audio_fallback_events += 1
+                mylogger.warning("WebRTC audio queue empty; emitting paced silence")
+            self._audio_fallback_frames += 1
+            self._audio_current_fallback_frames += 1
+            self._audio_max_fallback_frames = max(
+                self._audio_max_fallback_frames,
+                self._audio_current_fallback_frames,
+            )
+            if self._audio_speech_active:
+                if self._audio_current_speech_fallback_frames == 0:
+                    self._audio_speech_fallback_events += 1
+                self._audio_speech_fallback_frames += 1
+                self._audio_current_speech_fallback_frames += 1
+                self._audio_max_speech_fallback_frames = max(
+                    self._audio_max_speech_fallback_frames,
+                    self._audio_current_speech_fallback_frames,
+                )
+
+    def continuity_snapshot(self) -> dict:
+        frame_ms = round(AUDIO_PTIME * 1000)
+        with self._continuity_lock:
+            return {
+                "armed": self._audio_continuity_armed,
+                "fallback_events": self._audio_fallback_events,
+                "fallback_silence_ms": self._audio_fallback_frames * frame_ms,
+                "current_fallback_silence_ms": (
+                    self._audio_current_fallback_frames * frame_ms
+                ),
+                "max_fallback_silence_ms": self._audio_max_fallback_frames * frame_ms,
+                "speech_fallback_events": self._audio_speech_fallback_events,
+                "speech_fallback_silence_ms": (
+                    self._audio_speech_fallback_frames * frame_ms
+                ),
+                "current_speech_fallback_silence_ms": (
+                    self._audio_current_speech_fallback_frames * frame_ms
+                ),
+                "max_speech_fallback_silence_ms": (
+                    self._audio_max_speech_fallback_frames * frame_ms
+                ),
+            }
     
     def stop(self):
         super().stop()
@@ -231,6 +424,12 @@ class HumanPlayer:
 
         self.__container = avatar_session
         self.__generation_lock = threading.RLock()
+        self.__loop_watchdog_lock = threading.RLock()
+        self.__loop_watchdog_handle = None
+        self.__loop_watchdog_loop = None
+        self.__loop_watchdog_interval_s = 0.020
+        self.__loop_watchdog_ticks = 0
+        self.__loop_watchdog_events = []
         self.__generation = int(getattr(avatar_session, "generation", 0))
         self.__audio.set_generation(self.__generation)
         self.__video.set_generation(self.__generation)
@@ -281,6 +480,88 @@ class HumanPlayer:
         self.__audio.clear_queue()
         self.__video.clear_queue()
 
+    def continuity_snapshot(self) -> dict:
+        snapshot = self.__audio.continuity_snapshot()
+        snapshot["sender_timing"] = {
+            "audio": self.__audio.sender_timing_snapshot(),
+            "video": self.__video.sender_timing_snapshot(),
+            "event_loop": self._event_loop_timing_snapshot(),
+        }
+        return snapshot
+
+    def _ensure_loop_watchdog(self) -> None:
+        """Sample event-loop scheduling lag without changing media pacing.
+
+        A long interval between two calls to ``track.recv`` is ambiguous: it
+        can be time spent in aiortc's executor-backed encoder, transport send,
+        or a starved asyncio loop.  This independent 20-ms heartbeat makes
+        those cases distinguishable while retaining only bounded telemetry.
+        """
+
+        with self.__loop_watchdog_lock:
+            if self.__loop_watchdog_handle is not None:
+                return
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self.__loop_watchdog_loop = loop
+            expected_ns = time.monotonic_ns() + round(
+                self.__loop_watchdog_interval_s * 1_000_000_000
+            )
+            self.__loop_watchdog_handle = loop.call_later(
+                self.__loop_watchdog_interval_s,
+                self._loop_watchdog_tick,
+                expected_ns,
+            )
+
+    def _loop_watchdog_tick(self, expected_ns: int) -> None:
+        now_ns = time.monotonic_ns()
+        lag_ms = max(0.0, (now_ns - expected_ns) / 1_000_000)
+        event = {
+            "lag_ms": lag_ms,
+            "expected_monotonic_ms": expected_ns / 1_000_000,
+            "actual_monotonic_ms": now_ns / 1_000_000,
+        }
+        with self.__loop_watchdog_lock:
+            self.__loop_watchdog_ticks += 1
+            self.__loop_watchdog_events.append(event)
+            self.__loop_watchdog_events.sort(
+                key=lambda item: item["lag_ms"], reverse=True
+            )
+            del self.__loop_watchdog_events[8:]
+            loop = self.__loop_watchdog_loop
+            if loop is None or loop.is_closed():
+                self.__loop_watchdog_handle = None
+                return
+            next_expected_ns = now_ns + round(
+                self.__loop_watchdog_interval_s * 1_000_000_000
+            )
+            self.__loop_watchdog_handle = loop.call_later(
+                self.__loop_watchdog_interval_s,
+                self._loop_watchdog_tick,
+                next_expected_ns,
+            )
+
+    def _event_loop_timing_snapshot(self) -> dict:
+        with self.__loop_watchdog_lock:
+            events = [dict(item) for item in self.__loop_watchdog_events]
+            return {
+                "clock": "time.monotonic_ns",
+                "interval_ms": round(self.__loop_watchdog_interval_s * 1000),
+                "ticks": self.__loop_watchdog_ticks,
+                "lag_max_ms": None if not events else events[0]["lag_ms"],
+                "lag_events": events,
+            }
+
+    def _stop_loop_watchdog(self) -> None:
+        with self.__loop_watchdog_lock:
+            handle = self.__loop_watchdog_handle
+            self.__loop_watchdog_handle = None
+            self.__loop_watchdog_loop = None
+        if handle is not None:
+            handle.cancel()
+
     @staticmethod
     def _put_bounded(target: queue.Queue, item) -> None:
         """Never let a slow WebRTC consumer block the render thread."""
@@ -328,6 +609,7 @@ class HumanPlayer:
         return self.__video
 
     def _start(self, track: PlayerStreamTrack) -> None:
+        self._ensure_loop_watchdog()
         self.__started.add(track)
         if self.__thread is None:
             self.__log_debug("Starting worker thread")
@@ -367,6 +649,8 @@ class HumanPlayer:
         if not self.__started and self.__container is not None:
             #self.__container.close()
             self.__container = None
+        if not self.__started:
+            self._stop_loop_watchdog()
 
     @staticmethod
     def _reap_worker(worker: threading.Thread) -> None:

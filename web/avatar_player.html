@@ -91,6 +91,13 @@
             transform: scale(1.05);
             box-shadow: 0 6px 24px rgba(37, 99, 235, 0.6);
         }
+        .recovery-message {
+            max-width: min(420px, 86%);
+            color: #e2e8f0;
+            font-size: 14px;
+            line-height: 1.5;
+            text-align: center;
+        }
         input[type="checkbox"], #use-stun { display: none; }
     </style>
 </head>
@@ -107,6 +114,7 @@
     </div>
 
     <div class="start-overlay" id="startOverlay">
+        <div class="recovery-message" id="recoveryMessage">正在连接数字人，语音通道仍可使用</div>
         <button class="start-btn" id="btnConnect">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 3 19 12 5 21 5 3"/></svg>
             启动数字人 (Connect Avatar)
@@ -120,17 +128,26 @@
     <video id="video" autoplay="true" playsinline="true" muted></video>
 </div>
 
-<script src="client.js?v=7"></script>
+<script src="client.js?v=8"></script>
 <script>
     const statusDot = document.getElementById('statusDot');
     const statusLabel = document.getElementById('statusLabel');
     const startOverlay = document.getElementById('startOverlay');
+    const recoveryMessage = document.getElementById('recoveryMessage');
     const btnConnect = document.getElementById('btnConnect');
     const audio = document.getElementById('audio');
     const video = document.getElementById('video');
     let playbackMode = 'direct_audio';
     let avatarEventSource = null;
     let overlayHideTimer = null;
+    const AVATAR_RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 5000];
+    let reconnectTimer = null;
+    let reconnectAttempt = 0;
+    let connectInFlight = false;
+    let pendingReconnectReason = null;
+    let connectionAttemptToken = 0;
+    let sessionWatchTimer = null;
+    let pageClosing = false;
 
     function updateStatus(connected, text) {
         statusLabel.textContent = text;
@@ -139,6 +156,59 @@
         } else {
             statusDot.classList.remove('connected');
         }
+    }
+
+    function postRecoveryState(state, detail, delayMs = null) {
+        recoveryMessage.textContent = detail || '';
+        recoveryMessage.style.display = state === 'connected' ? 'none' : 'block';
+        document.body.dataset.avatarRecoveryState = state;
+        document.body.dataset.avatarRecoveryAttempt = String(reconnectAttempt);
+        document.body.dataset.avatarRecoveryDetail = detail || '';
+        if (!window.parent || window.parent === window) return;
+        window.parent.postMessage({
+            type: 'xiaoman-avatar-recovery',
+            state,
+            detail: detail || '',
+            attempt: reconnectAttempt,
+            delay_ms: delayMs,
+        }, '*');
+    }
+
+    function clearReconnectTimer() {
+        if (reconnectTimer !== null) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+    }
+
+    function scheduleAvatarReconnect(reason) {
+        if (pageClosing || reconnectTimer !== null) return false;
+        if (connectInFlight) {
+            pendingReconnectReason = reason;
+            return false;
+        }
+        reconnectAttempt += 1;
+        const delayMs = AVATAR_RECONNECT_DELAYS_MS[
+            Math.min(reconnectAttempt - 1, AVATAR_RECONNECT_DELAYS_MS.length - 1)
+        ];
+        const delaySeconds = (delayMs / 1000).toFixed(delayMs % 1000 ? 1 : 0);
+        const detail = `数字人暂不可用，语音继续；${delaySeconds} 秒后自动重连`;
+        updateStatus(false, detail);
+        btnConnect.disabled = false;
+        btnConnect.textContent = '立即重连';
+        showAudioUnlock();
+        btnConnect.textContent = '立即重连';
+        postRecoveryState('waiting', detail, delayMs);
+        reconnectTimer = setTimeout(() => {
+            reconnectTimer = null;
+            initWebRTC({automatic: true, reason});
+        }, delayMs);
+        return true;
+    }
+
+    function clearAvatarMedia() {
+        if (audio) audio.srcObject = null;
+        if (video) video.srcObject = null;
     }
 
     function postPlaybackState(ready, error = null) {
@@ -291,27 +361,40 @@
     }
 
     function watchAvatarSessionId() {
+        if (sessionWatchTimer !== null) clearInterval(sessionWatchTimer);
         const timer = setInterval(() => {
             // The offer response and the connected transition can happen in
             // either order on localhost.  Never let this polling fallback
             // overwrite a newer true announcement with a hard-coded false.
             if (postAvatarSession(isAvatarConnected())) {
                 clearInterval(timer);
+                if (sessionWatchTimer === timer) sessionWatchTimer = null;
             }
         }, 50);
-        setTimeout(() => clearInterval(timer), 15000);
+        sessionWatchTimer = timer;
+        setTimeout(() => {
+            clearInterval(timer);
+            if (sessionWatchTimer === timer) {
+                sessionWatchTimer = null;
+            }
+        }, 15000);
         return timer;
     }
 
-    function handleAvatarConnectionState() {
-        if (!pc) return;
-        const state = pc.connectionState;
+    function handleAvatarConnectionState(event) {
+        const connection = event && event.currentTarget ? event.currentTarget : pc;
+        if (!connection || connection !== pc) return;
+        const state = connection.connectionState;
         console.log('WebRTC state:', state);
         if (state === 'connected') {
+            clearReconnectTimer();
+            pendingReconnectReason = null;
+            reconnectAttempt = 0;
             postAvatarSession(true);
             startAvatarEvents();
             applyPlaybackMode(playbackMode);
             updateStatus(true, '数字人已在线');
+            postRecoveryState('connected', '数字人已在线');
             if (playbackMode === 'strict_sync') {
                 // Keep a one-click unlock available until the browser has
                 // confirmed audible WebRTC playback.
@@ -330,6 +413,7 @@
             btnConnect.textContent = '重新连接';
             showAudioUnlock();
             btnConnect.textContent = '重新连接';
+            scheduleAvatarReconnect('Avatar WebRTC ' + state);
         }
     }
 
@@ -337,6 +421,16 @@
         if (pc && pc.connectionState === 'connected') return true;
         return Boolean(video.srcObject && video.readyState >= 2);
     }
+
+    window.addEventListener('xiaoman-avatar-heartbeat', (event) => {
+        const detail = event.detail || {};
+        if (pageClosing || detail.ok || Number(detail.failures || 0) < 2) return;
+        const reason = detail.error || 'Avatar heartbeat unavailable';
+        stopAvatarEvents();
+        postAvatarSession(false);
+        postPlaybackState(false, reason);
+        scheduleAvatarReconnect(reason);
+    });
 
     // Replay state when the parent is ready.  This closes a localhost race in
     // which the offer can complete before the parent message listener exists.
@@ -351,13 +445,26 @@
         }
     });
 
-    async function initWebRTC() {
+    async function initWebRTC({automatic = false, reason = ''} = {}) {
+        if (pageClosing || connectInFlight) return false;
+        clearReconnectTimer();
+        connectInFlight = true;
+        pendingReconnectReason = null;
+        const attemptToken = ++connectionAttemptToken;
         btnConnect.disabled = true;
         btnConnect.textContent = "连接中...";
-        updateStatus(false, "正在握手 WebRTC...");
+        const connectingText = automatic
+            ? `正在自动重连数字人（第 ${reconnectAttempt} 次）...`
+            : "正在握手 WebRTC...";
+        updateStatus(false, connectingText);
+        postRecoveryState(automatic ? 'retrying' : 'connecting', connectingText);
 
         try {
-            if (pc) stop();
+            if (pc) {
+                postAvatarSession(false, true);
+                stop();
+            }
+            clearAvatarMedia();
             resetAvatarSessionAnnouncement();
             const startPromise = start();
             if (pc) {
@@ -365,6 +472,7 @@
             }
             watchAvatarSessionId();
             await startPromise;
+            if (attemptToken !== connectionAttemptToken || pageClosing) return false;
             // client.js writes the ID immediately after the offer response.
             // setRemoteDescription can also transition to "connected" before
             // this await resumes, so replay the authoritative state instead
@@ -375,25 +483,44 @@
 
             // Fallback timeout check
             setTimeout(() => {
+                if (attemptToken !== connectionAttemptToken || pageClosing) return;
                 if (!pc || pc.connectionState !== 'connected') {
                     if (video.srcObject && video.readyState >= 2) {
                         postAvatarSession(true);
                         updateStatus(true, '数字人已在线');
+                        clearReconnectTimer();
+                        pendingReconnectReason = null;
+                        reconnectAttempt = 0;
+                        postRecoveryState('connected', '数字人已在线');
                         hideStartOverlay();
                         video.muted = true;
                         video.play().catch(() => {});
                         startAvatarEvents();
                         applyPlaybackMode(playbackMode);
+                    } else {
+                        scheduleAvatarReconnect('Avatar WebRTC connection timeout');
                     }
                 }
             }, 3000);
+            return true;
 
         } catch (e) {
             console.error("WebRTC start error:", e);
             postAvatarSession(false);
-            updateStatus(false, "连接异常: " + e.message);
+            const errorText = "连接异常: " + e.message;
+            updateStatus(false, errorText);
             btnConnect.disabled = false;
             btnConnect.textContent = "重试";
+            postRecoveryState('failed', errorText);
+            pendingReconnectReason = reason || errorText;
+            return false;
+        } finally {
+            connectInFlight = false;
+            if (pendingReconnectReason && !pageClosing) {
+                const retryReason = pendingReconnectReason;
+                pendingReconnectReason = null;
+                scheduleAvatarReconnect(retryReason);
+            }
         }
     }
 
@@ -401,7 +528,9 @@
         if (isAvatarConnected()) {
             applyPlaybackMode(playbackMode);
         } else {
-            initWebRTC();
+            clearReconnectTimer();
+            reconnectAttempt = 0;
+            initWebRTC({automatic: false, reason: 'manual reconnect'});
         }
     });
 
@@ -418,18 +547,25 @@
         applyPlaybackMode(playbackMode);
     });
 
-    // pagehide fires for tab close/navigation and is more reliable than
-    // relying on the LiveTalking client's delayed pc.close() callbacks.
-    window.addEventListener('pagehide', () => {
+    function shutdownAvatarPage() {
+        if (pageClosing) return;
+        pageClosing = true;
+        connectionAttemptToken += 1;
+        clearReconnectTimer();
+        if (sessionWatchTimer !== null) {
+            clearInterval(sessionWatchTimer);
+            sessionWatchTimer = null;
+        }
         stopAvatarEvents();
         postAvatarSession(false, true);
         stop();
-    });
-    window.addEventListener('beforeunload', () => {
-        stopAvatarEvents();
-        postAvatarSession(false, true);
-        stop();
-    });
+        clearAvatarMedia();
+    }
+
+    // Capture phase runs before client.js' own bubble listener, preserving the
+    // last session ID long enough to announce the disconnect to the parent.
+    window.addEventListener('pagehide', shutdownAvatarPage, {capture: true});
+    window.addEventListener('beforeunload', shutdownAvatarPage, {capture: true});
 </script>
 </body>
 </html>

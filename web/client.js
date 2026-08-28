@@ -1,23 +1,52 @@
 var pc = null;
 var sessionHeartbeatTimer = null;
+var sessionHeartbeatFailures = 0;
+var sessionHeartbeatSerial = 0;
 
 function stopSessionHeartbeat() {
+    sessionHeartbeatSerial += 1;
     if (sessionHeartbeatTimer !== null) {
         clearInterval(sessionHeartbeatTimer);
         sessionHeartbeatTimer = null;
     }
+    sessionHeartbeatFailures = 0;
 }
 
 function startSessionHeartbeat(sessionId) {
     stopSessionHeartbeat();
+    var heartbeatSerial = sessionHeartbeatSerial;
     var endpoint = ((window.location.origin && window.location.origin !== 'null')
         ? window.location.origin : 'http://localhost:8010') + '/api/session/heartbeat';
+    var publishHeartbeat = (ok, error) => window.dispatchEvent(new CustomEvent(
+        'xiaoman-avatar-heartbeat',
+        {detail: {
+            ok: Boolean(ok),
+            session_id: String(sessionId),
+            failures: sessionHeartbeatFailures,
+            error: error || null,
+        }}
+    ));
     var renew = () => fetch(endpoint, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({sessionid: sessionId}),
-    }).catch(() => {});
-    sessionHeartbeatTimer = setInterval(renew, 10000);
+    }).then(async (response) => {
+        if (heartbeatSerial !== sessionHeartbeatSerial) return;
+        if (!response.ok) throw new Error('heartbeat HTTP ' + response.status);
+        var payload = await response.json();
+        if (heartbeatSerial !== sessionHeartbeatSerial) return;
+        if (Number(payload.code) !== 0) {
+            throw new Error(payload.msg || 'heartbeat session rejected');
+        }
+        sessionHeartbeatFailures = 0;
+        publishHeartbeat(true, null);
+    }).catch((error) => {
+        if (heartbeatSerial !== sessionHeartbeatSerial) return;
+        sessionHeartbeatFailures += 1;
+        publishHeartbeat(false, error && error.message ? error.message : String(error));
+    });
+    renew();
+    sessionHeartbeatTimer = setInterval(renew, 3000);
 }
 
 function negotiate() {

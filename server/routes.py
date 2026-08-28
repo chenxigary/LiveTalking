@@ -105,6 +105,12 @@ def _audio_metadata_from_headers(request) -> dict:
     return metadata
 
 
+def _ingest_uploaded_audio(avatar_session, fileobj, datainfo):
+    """Decode and enqueue one upload away from aiohttp's event-loop thread."""
+
+    return avatar_session.put_audio_file(fileobj.file.read(), datainfo)
+
+
 # ─── 路由处理函数 ──────────────────────────────────────────────────────────
 
 async def human(request):
@@ -196,7 +202,6 @@ async def humanaudio(request):
         form = await request.post()
         sessionid = str(form.get('sessionid', ''))
         fileobj = form["file"]
-        filebytes = fileobj.file.read()
 
         datainfo = _audio_metadata_from_headers(request)
 
@@ -206,7 +211,21 @@ async def humanaudio(request):
         # A stale packet is intentionally acknowledged.  The Adapter can
         # safely continue uploading current packets while the old generation
         # is being invalidated, and the public endpoint remains compatible.
-        accepted = avatar_session.put_audio_file(filebytes, datainfo)
+        # soundfile decode, resampling and chunk materialisation are blocking.
+        # Serialize uploads per session to preserve packet order, but execute
+        # that work outside the aiohttp/aiortc event loop so RTP pacing cannot
+        # be delayed by an incoming audio chunk.
+        ingest_lock = getattr(avatar_session, "_humanaudio_ingest_lock", None)
+        if ingest_lock is None:
+            ingest_lock = asyncio.Lock()
+            setattr(avatar_session, "_humanaudio_ingest_lock", ingest_lock)
+        async with ingest_lock:
+            accepted = await asyncio.to_thread(
+                _ingest_uploaded_audio,
+                avatar_session,
+                fileobj,
+                datainfo,
+            )
         if accepted is False and datainfo.get("end"):
             return json_error("avatar rejected final audio packet", code=-2)
         return json_ok()
@@ -260,6 +279,13 @@ async def is_speaking(request):
     snapshot = getattr(asr, "continuity_snapshot", None)
     if callable(snapshot):
         continuity = snapshot()
+    output = getattr(avatar_session, "output", None)
+    player = getattr(output, "_player", None)
+    transport_snapshot = getattr(player, "continuity_snapshot", None)
+    if callable(transport_snapshot):
+        if continuity is None:
+            continuity = {}
+        continuity["webrtc"] = transport_snapshot()
     return json_ok(
         data=avatar_session.is_speaking(),
         continuity=continuity,

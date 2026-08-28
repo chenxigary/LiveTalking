@@ -214,7 +214,11 @@ def main():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(runner.setup())
-        site = web.TCPSite(runner, '0.0.0.0', opt.listenport)
+        # Keep the upstream all-interface default for standalone deployments,
+        # while allowing local shells to enforce a loopback-only signaling and
+        # audio-upload boundary without carrying a second server implementation.
+        listen_host = os.getenv('LIVETALKING_HOST', '0.0.0.0').strip() or '0.0.0.0'
+        site = web.TCPSite(runner, listen_host, opt.listenport)
         loop.run_until_complete(site.start())
         if opt.transport=='rtcpush':
             for k in range(opt.max_session):

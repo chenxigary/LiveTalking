@@ -36,6 +36,8 @@ class SessionManager:
             self.build_session_fn = None
             self.max_session = 1   # default, override via set_max_session()
             self.initialized = True
+        if not hasattr(self, "_pending_sessions"):
+            self._pending_sessions = set()
 
     def set_max_session(self, n: int):
         """设置最大并发会话数"""
@@ -64,30 +66,61 @@ class SessionManager:
         if sessionid is None:
             sessionid = _rand_session_id()
             
-        # 检查是否达到最大会话数
-        active_count = sum(1 for s in self.sessions.values() if s is not None)
+        # Count in-flight reservations as well as fully-built sessions.  The
+        # builder runs in an executor, so concurrent /offer requests can all
+        # reach this point while earlier builds are still running.  Ignoring
+        # those reservations allowed max_session=5 to admit six or more
+        # simultaneous Wav2Lip sessions during a browser reconnect burst.
+        active_count = len(self.sessions) + len(self._pending_sessions)
         if active_count >= self.max_session:
             raise MaxSessionError(
                 f"Maximum session limit reached ({active_count}/{self.max_session})"
             )
 
+        if sessionid in self.sessions or sessionid in self._pending_sessions:
+            raise MaxSessionError(f"Session already exists: {sessionid}")
+
         logger.info('Creating sessionid=%s, current session num=%d', sessionid, active_count)
-        # 预先占位防止重复
-        self.sessions[sessionid] = None
+        self._pending_sessions.add(sessionid)
 
         # 在线程池中构建 session（加载模型非常耗时）
-        avatar_session = await asyncio.get_event_loop().run_in_executor(
+        build_future = asyncio.get_running_loop().run_in_executor(
             None, self.build_session_fn, sessionid, params
         )
+        try:
+            # Shield the executor future so an abandoned HTTP request cannot
+            # cancel the bookkeeping future while its worker keeps consuming
+            # resources.  The reservation is released only when that worker
+            # has actually stopped.
+            avatar_session = await asyncio.shield(build_future)
+        except asyncio.CancelledError:
+            def release_abandoned_build(future):
+                self._pending_sessions.discard(sessionid)
+                try:
+                    future.result()
+                except BaseException:
+                    pass
+
+            build_future.add_done_callback(release_abandoned_build)
+            raise
+        except BaseException:
+            # A failed build must release its reservation or all later offers
+            # can be rejected indefinitely even though no usable session was
+            # created.
+            self._pending_sessions.discard(sessionid)
+            raise
+        self._pending_sessions.discard(sessionid)
         self.sessions[sessionid] = avatar_session
         return sessionid
         
     def add_session(self, sessionid: str, avatar_session: BaseAvatar):
         """同步添加静态或外部管理的会话（供非服务端入口调用）"""
+        self._pending_sessions.discard(sessionid)
         self.sessions[sessionid] = avatar_session
         
     def remove_session(self, sessionid: str):
         """销毁会话资源"""
+        self._pending_sessions.discard(sessionid)
         if sessionid in self.sessions:
             logger.info(f"Removing session {sessionid}")
             # todo: 还可以主动调 avatar_session 释放

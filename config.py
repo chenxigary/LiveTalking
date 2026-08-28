@@ -52,6 +52,15 @@ def parse_args():
     parser.add_argument('-l', type=int, default=10)
     parser.add_argument('-m', type=int, default=8)
     parser.add_argument('-r', type=int, default=10)
+    parser.add_argument(
+        '--speech_rms_threshold',
+        type=float,
+        default=0.006,
+        help=(
+            "normalized 20ms PCM RMS below which Avatar keeps the idle mouth; "
+            "audio is still forwarded unchanged"
+        ),
+    )
 
     # ─── 画面 ──────────────────────────────────────────────────────────
     # parser.add_argument('--W', type=int, default=450, help="GUI width")

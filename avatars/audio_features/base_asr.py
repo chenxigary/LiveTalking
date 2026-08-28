@@ -75,6 +75,9 @@ class BaseASR:
         self.fps = opt.fps # 20 ms per frame
         self.sample_rate = 16000
         self.chunk = self.sample_rate // (opt.fps*2) # 320 samples per chunk (20ms * 16000 / 1000)
+        self.speech_rms_threshold = max(
+            0.0, float(getattr(opt, "speech_rms_threshold", 0.006))
+        )
         self.queue:Queue[AudioFrameData] = Queue()
         self.output_queue:Queue[AudioFrameData] = Queue()
 
@@ -227,12 +230,19 @@ class BaseASR:
         if not self.set_generation(generation, clear=generation > self.generation):
             return False
         metadata["generation"] = generation
+        audio_chunk = np.asarray(audio_chunk, dtype=np.float32).reshape(-1)
+        rms = (
+            float(np.sqrt(np.mean(np.square(audio_chunk))))
+            if audio_chunk.size
+            else 0.0
+        )
+        frame_type = 0 if rms >= self.speech_rms_threshold else 1
         with self._state_lock:
             if generation != self._generation:
                 return False
             self.queue.put(AudioFrameData(
                 data=audio_chunk,
-                type=0,
+                type=frame_type,
                 userdata=metadata,
                 generation=generation,
             ))
