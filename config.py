@@ -53,6 +53,16 @@ def parse_args():
     parser.add_argument('-m', type=int, default=8)
     parser.add_argument('-r', type=int, default=10)
     parser.add_argument(
+        '--audio_output_rate',
+        type=int,
+        default=24000,
+        help=(
+            "sample rate of the audio sent to the client; lip features stay "
+            "at 16kHz regardless. 24000 matches Qwen3-TTS and keeps the "
+            "8-12kHz sibilance band a 16kHz stream discards"
+        ),
+    )
+    parser.add_argument(
         '--speech_rms_threshold',
         type=float,
         default=0.006,
@@ -78,11 +88,60 @@ def parse_args():
         default=1,
         help=(
             "reuse one inferred mouth pose for this many 25-fps output frames; "
-            "use 4 for real-time Wav2Lip on slower Apple GPUs"
+            "in adaptive mode this is the upper bound, not the running value"
+        ),
+    )
+    parser.add_argument(
+        '--inference_stride_mode',
+        type=str,
+        default='adaptive',
+        choices=('adaptive', 'fixed'),
+        help=(
+            "adaptive: run at stride 1 and widen only when measured inference "
+            "latency misses the frame budget; fixed: always use "
+            "--inference_stride (use for A/B measurements)"
         ),
     )
     parser.add_argument('--modelres', type=int, default=256)
     parser.add_argument('--modelfile', type=str, default='')
+    parser.add_argument(
+        '--paste_back_mode',
+        type=str,
+        default='lower',
+        choices=('lower', 'full'),
+        help=(
+            "lower: composite only the audio-driven lower face back, keeping "
+            "eyes/hair at source sharpness; full: upstream whole-crop paste"
+        ),
+    )
+    parser.add_argument(
+        '--paste_back_feather',
+        type=int,
+        default=24,
+        help="rows blended across the lower-face seam (--paste_back_mode=lower)",
+    )
+    parser.add_argument(
+        '--paste_back_edge',
+        type=int,
+        default=12,
+        help="pixels faded at the face-crop border (--paste_back_mode=lower)",
+    )
+    parser.add_argument(
+        '--idle_motion_scale',
+        type=float,
+        default=1.0,
+        help=(
+            "how fast the idle loop plays between turns, 0.05-1.0. Lower it "
+            "when the source clip's own motion looks restless; 0.5 halves the "
+            "movement frequency by holding each source frame twice"
+        ),
+    )
+    parser.add_argument(
+        '--debug_label',
+        action='store_true',
+        default=False,
+        help="draw the LiveTalking watermark on every rendered frame",
+    )
 
     # ─── 自定义动作和多形象 ────────────────────────────────────────────
     parser.add_argument('--customvideo_config', type=str, default='',
@@ -106,6 +165,24 @@ def parse_args():
     parser.add_argument('--max_session', type=int, default=5)
     parser.add_argument('--listenport', type=int, default=8010,
                         help="web listen port")
+    parser.add_argument(
+        '--video_bitrate',
+        type=int,
+        default=3_000_000,
+        help=(
+            "starting WebRTC video bitrate in bps; aiortc's own 1 Mbps default "
+            "costs 2.4 dB PSNR on this project's frames"
+        ),
+    )
+    parser.add_argument(
+        '--video_max_bitrate',
+        type=int,
+        default=8_000_000,
+        help=(
+            "WebRTC video bitrate ceiling in bps, capped at the advertised "
+            "H264 Level 3.1 limit of 14 Mbps"
+        ),
+    )
 
     # ─── 虚拟摄像头 ───────────────────────────────────────────────────
     parser.add_argument('--audio_output_device', type=int, default=None,

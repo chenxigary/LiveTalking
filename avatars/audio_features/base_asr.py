@@ -75,6 +75,10 @@ class BaseASR:
         self.fps = opt.fps # 20 ms per frame
         self.sample_rate = 16000
         self.chunk = self.sample_rate // (opt.fps*2) # 320 samples per chunk (20ms * 16000 / 1000)
+        # Mirrors BaseAvatar.output_chunk: the frames this queue hands to the
+        # renderer carry both the 16kHz feature span and the output-rate span.
+        self.output_sample_rate = int(getattr(opt, "audio_output_rate", 24000))
+        self.output_chunk = self.output_sample_rate // (opt.fps * 2)
         self.speech_rms_threshold = max(
             0.0, float(getattr(opt, "speech_rms_threshold", 0.006))
         )
@@ -224,7 +228,7 @@ class BaseASR:
             raise ValueError("generation must be non-negative")
         return generation
 
-    def put_audio_frame(self, audio_chunk: NDArray[np.float32], datainfo: dict | None = None): #16khz 20ms pcm
+    def put_audio_frame(self, audio_chunk: NDArray[np.float32], datainfo: dict | None = None, output_chunk=None): #16khz 20ms pcm
         metadata = dict(datainfo or {})
         generation = self._metadata_generation(metadata)
         if not self.set_generation(generation, clear=generation > self.generation):
@@ -245,6 +249,10 @@ class BaseASR:
                 type=frame_type,
                 userdata=metadata,
                 generation=generation,
+                output=(
+                    None if output_chunk is None
+                    else np.asarray(output_chunk, dtype=np.float32).reshape(-1)
+                ),
             ))
         return True
 
@@ -325,6 +333,7 @@ class BaseASR:
                     type=1,
                     userdata={"generation": current},
                     generation=current,
+                    output=np.zeros(self.output_chunk, dtype=np.float32),
                 )
 
 

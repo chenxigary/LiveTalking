@@ -32,6 +32,9 @@ AUDIO_PTIME = 0.020  # 20ms audio packetization
 VIDEO_CLOCK_RATE = 90000
 VIDEO_PTIME = 0.040 #1 / 25  # 30fps
 VIDEO_TIME_BASE = fractions.Fraction(1, VIDEO_CLOCK_RATE)
+# Fallback only. The real rate is per-track (PlayerStreamTrack.sample_rate)
+# because the Avatar's audio output rate is configurable: lip features are
+# locked to 16kHz, the listener's audio is not.
 SAMPLE_RATE = 16000
 AUDIO_TIME_BASE = fractions.Fraction(1, SAMPLE_RATE)
 
@@ -51,10 +54,12 @@ class PlayerStreamTrack(MediaStreamTrack):
     A video track that returns an animated flag.
     """
 
-    def __init__(self, player, kind):
+    def __init__(self, player, kind, sample_rate: int = SAMPLE_RATE):
         super().__init__()  # don't forget this!
         self.kind = kind
         self._player = player
+        self.sample_rate = int(sample_rate)
+        self.audio_time_base = fractions.Fraction(1, self.sample_rate)
         self._queue = queue.Queue(maxsize=100)
         self._generation = 0
         self._generation_lock = threading.RLock()
@@ -117,7 +122,7 @@ class PlayerStreamTrack(MediaStreamTrack):
         else: #audio
             if hasattr(self, "_timestamp"):
                 #self._timestamp = (time.time()-self._start) * SAMPLE_RATE
-                self._timestamp += int(AUDIO_PTIME * SAMPLE_RATE)
+                self._timestamp += int(AUDIO_PTIME * self.sample_rate)
                 self.current_frame_count += 1
                 target = self._start + self.current_frame_count * AUDIO_PTIME
                 now = time.time()
@@ -137,7 +142,7 @@ class PlayerStreamTrack(MediaStreamTrack):
                 self._timestamp = 0
                 self.timelist.append(self._start)
                 mylogger.info('audio start:%f',self._start)
-            return self._timestamp, AUDIO_TIME_BASE
+            return self._timestamp, self.audio_time_base
 
     async def recv(self) -> Union[Frame, Packet]:
         recv_entry_monotonic_ms = time.monotonic_ns() / 1_000_000
@@ -176,14 +181,14 @@ class PlayerStreamTrack(MediaStreamTrack):
                 break
             except queue.Empty:
                 if self.kind == "audio" and self._audio_continuity_armed:
-                    samples = round(AUDIO_PTIME * SAMPLE_RATE)
+                    samples = round(AUDIO_PTIME * self.sample_rate)
                     audio = np.zeros((1, samples), dtype=np.int16)
                     frame = AudioFrame.from_ndarray(
                         audio,
                         layout="mono",
                         format="s16",
                     )
-                    frame.sample_rate = SAMPLE_RATE
+                    frame.sample_rate = self.sample_rate
                     eventpoint = None
                     generation = self.generation
                     used_audio_fallback = True
@@ -419,7 +424,12 @@ class HumanPlayer:
         self.__audio: Optional[PlayerStreamTrack] = None
         self.__video: Optional[PlayerStreamTrack] = None
 
-        self.__audio = PlayerStreamTrack(self, kind="audio")
+        self.audio_sample_rate = int(
+            getattr(avatar_session, "output_sample_rate", SAMPLE_RATE)
+        )
+        self.__audio = PlayerStreamTrack(
+            self, kind="audio", sample_rate=self.audio_sample_rate
+        )
         self.__video = PlayerStreamTrack(self, kind="video")
 
         self.__container = avatar_session
@@ -450,7 +460,7 @@ class HumanPlayer:
         from av import AudioFrame
         new_frame = AudioFrame(format='s16', layout='mono', samples=frame.shape[0])
         new_frame.planes[0].update(frame.tobytes())
-        new_frame.sample_rate = 16000
+        new_frame.sample_rate = self.audio_sample_rate
         metadata_generation = self.generation
         if isinstance(eventpoint, dict) and eventpoint.get("generation") is not None:
             try:

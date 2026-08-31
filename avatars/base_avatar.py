@@ -59,18 +59,42 @@ from utils.image import (
 #     QUESTION=2
 #     ANSWER=3
 
+# Share of the 40ms frame budget an inference may consume before the adaptive
+# controller widens the stride.  The margin covers paste-back, H264 encode and
+# scheduler jitter, which all land on the same deadline.
+_STRIDE_SAFETY = 1.25
+# EMA weight for measured inference latency: about five frames (200ms at
+# 25fps) to react, which tracks a TTS burst without flapping every frame.
+_STRIDE_EMA_ALPHA = 0.2
+
+
 @dataclass
 class AudioFrameData:
     data: NDArray[np.float32]
     type: int = 0  # 默认值
     userdata: dict = field(default_factory=dict)
     generation: int = 0
+    # Same 20ms span as ``data`` but at the Avatar's output rate. ``data`` is
+    # pinned to 16kHz because that is what the lip model's mel front-end
+    # requires; there is no reason for the listener to inherit that ceiling.
+    # ``None`` means a legacy producer supplied only the feature-rate frame.
+    output: NDArray[np.float32] | None = None
 
 class BaseAvatar:
     def __init__(self, opt):
         self.opt = opt
         self.sample_rate = 16000
         self.chunk = self.sample_rate // (opt.fps*2) # 320 samples per chunk (20ms)
+        # Qwen3-TTS emits 24kHz and 1.19% of its measured power sits in the
+        # 8-12kHz band a 16kHz stream discards -- the sibilance that separates
+        # "podcast" from "phone call". Features stay at 16kHz regardless.
+        self.output_sample_rate = int(getattr(opt, "audio_output_rate", 24000))
+        if self.output_sample_rate % (opt.fps * 2):
+            raise ValueError(
+                f"audio_output_rate {self.output_sample_rate} must divide into "
+                f"20ms frames at fps={opt.fps}"
+            )
+        self.output_chunk = self.output_sample_rate // (opt.fps * 2)
         self.sessionid = self.opt.sessionid
 
         # The HTTP route and render loop run on different threads.  This lock
@@ -83,7 +107,12 @@ class BaseAvatar:
         # 24kHz 50ms source chunk becomes 800 samples at 16kHz).  Keep that
         # remainder across streaming uploads instead of dropping it on every
         # request.  Generation/turn changes clear it synchronously.
+        # The tail is kept at the *source* rate so that the 16kHz feature
+        # stream and the output stream are both derived from one 20ms-aligned
+        # buffer. Resampling each independently would let their frame counts
+        # drift apart across uploads.
         self._audio_tail = np.empty(0, dtype=np.float32)
+        self._audio_tail_rate = 0
         self._audio_tail_generation = 0
         self._audio_tail_turn_id = None
         self._audio_tail_pts_ms = 0
@@ -118,6 +147,40 @@ class BaseAvatar:
             )
             requested_stride = 1
         self.inference_stride = requested_stride
+        mode = str(getattr(opt, "inference_stride_mode", "adaptive")).strip().lower()
+        if mode not in {"adaptive", "fixed"}:
+            raise ValueError("inference_stride_mode must be 'adaptive' or 'fixed'")
+        # Stride trades lip-sync fidelity for throughput: one inferred pose is
+        # held across `stride` frames, so 3/4 of the frames carry no mouth
+        # change. It exists because inference also gates audio delivery — this
+        # loop emits `stride` frames' worth of audio per model call — so a
+        # stride too small for the hardware breaks the voice, not just the lips.
+        # Adaptive mode therefore runs at 1 and only degrades (up to
+        # `inference_stride`) when measured latency says it must.
+        self.inference_stride_mode = mode
+        self._active_stride = 1 if mode == "adaptive" else requested_stride
+        self._inference_ema_sec = 0.0
+        # Monotonic render telemetry. Read without a lock on purpose: these
+        # only ever increase, and a status read that races a render step is
+        # off by one frame, which is meaningless at 25fps.
+        self._inference_samples = 0
+        self._speaking_frames = 0
+        self._audio_push_logged = False
+        logger.info(
+            "inference stride: mode=%s limit=%d start=%d",
+            self.inference_stride_mode,
+            self.inference_stride,
+            self._active_stride,
+        )
+        self.debug_label = bool(getattr(opt, "debug_label", False))
+        # Idle playback speed. The source loop's own motion sets how restless
+        # the avatar looks between turns; this project's clip measures 2.76 Hz
+        # of head movement, which reads as fidgeting rather than breathing.
+        # Holding each source frame longer during silence lowers that
+        # frequency without new material. Speaking frames are unaffected.
+        self.idle_motion_scale = float(getattr(opt, "idle_motion_scale", 1.0))
+        if not 0.05 <= self.idle_motion_scale <= 1.0:
+            raise ValueError("idle_motion_scale must be between 0.05 and 1.0")
         self.res_frame_queue = Queue(self.batch_size*2)
         self.render_event = Event()
 
@@ -234,6 +297,7 @@ class BaseAvatar:
         """Drop an incomplete streaming WAV tail during a pipeline reset."""
 
         self._audio_tail = np.empty(0, dtype=np.float32)
+        self._audio_tail_rate = 0
         self._audio_tail_generation = self._generation
         self._audio_tail_turn_id = None
         self._audio_tail_pts_ms = 0
@@ -272,7 +336,7 @@ class BaseAvatar:
                 self.tts.put_msg_txt(msg, metadata)
             return True
     
-    def put_audio_frame(self, audio_chunk:NDArray[np.float32], datainfo:dict | None = None): # 16khz 20ms pcm
+    def put_audio_frame(self, audio_chunk:NDArray[np.float32], datainfo:dict | None = None, output_chunk=None): # 16khz 20ms pcm
         with self._pipeline_lock:
             metadata = dict(datainfo or {})
             generation = self._coerce_generation(
@@ -282,7 +346,7 @@ class BaseAvatar:
                 return False
             metadata["generation"] = generation
             if hasattr(self, 'asr'):
-                return self.asr.put_audio_frame(audio_chunk, metadata)
+                return self.asr.put_audio_frame(audio_chunk, metadata, output_chunk)
             return False
 
     def put_audio_file(self, filebyte, datainfo:dict | None = None):
@@ -295,7 +359,7 @@ class BaseAvatar:
                 return False
 
         input_stream = BytesIO(filebyte)
-        stream = self.__create_bytes_stream(input_stream)
+        stream, source_rate = self.__create_bytes_stream(input_stream)
         streaming = bool(metadata.get("streaming"))
         stream = np.asarray(stream, dtype=np.float32).reshape(-1)
 
@@ -319,6 +383,7 @@ class BaseAvatar:
                     not self._audio_stream_initialized
                     or self._audio_tail_generation != generation
                     or self._audio_tail_turn_id != normalized_turn
+                    or self._audio_tail_rate != source_rate
                 ):
                     # A turn switch without an explicit end is a malformed or
                     # interrupted stream.  Never combine its tail with the new
@@ -326,6 +391,7 @@ class BaseAvatar:
                     # clearing it in _clear_pipeline_locked().
                     self._clear_audio_tail_locked()
                     self._audio_stream_initialized = True
+                    self._audio_tail_rate = source_rate
                     self._audio_tail_generation = generation
                     self._audio_tail_turn_id = normalized_turn
                     self._audio_start_pending = bool(metadata.get("start"))
@@ -354,19 +420,31 @@ class BaseAvatar:
             last_seq = self._metadata_seq(metadata, "last_seq")
             if last_seq < first_seq:
                 last_seq = first_seq
-            full_count = combined.size // self.chunk
-            remainder = combined[full_count * self.chunk:]
+            source_chunk = max(1, source_rate // (self.opt.fps * 2))
+            full_count = combined.size // source_chunk
+            remainder = combined[full_count * source_chunk:]
             if end_requested and remainder.size:
                 # End padding happens once, after all cross-upload tails have
                 # been appended.  This preserves the last partial audio while
                 # keeping LiveTalking's 20ms frame contract.
                 combined = np.pad(
                     combined,
-                    (0, self.chunk - remainder.size),
+                    (0, source_chunk - remainder.size),
                     mode="constant",
                 )
-                full_count = combined.size // self.chunk
+                full_count = combined.size // source_chunk
                 remainder = np.empty(0, dtype=np.float32)
+
+            # One 20ms-aligned source buffer, two derived streams: 16kHz for
+            # the lip model's mel front-end, output rate for the listener.
+            usable = combined[: full_count * source_chunk]
+            feature_stream = self._resample_exact(
+                usable, source_rate, self.sample_rate, full_count * self.chunk
+            )
+            output_stream = self._resample_exact(
+                usable, source_rate, self.output_sample_rate,
+                full_count * self.output_chunk,
+            )
 
             for index in range(full_count):
                 eventpoint = dict(metadata)
@@ -397,8 +475,11 @@ class BaseAvatar:
                 eventpoint["generation"] = generation
                 eventpoint["pts_ms"] = tail_pts_ms + index * self._frame_duration_ms()
                 if not self.put_audio_frame(
-                    combined[index * self.chunk:(index + 1) * self.chunk],
+                    feature_stream[index * self.chunk:(index + 1) * self.chunk],
                     eventpoint,
+                    output_stream[
+                        index * self.output_chunk:(index + 1) * self.output_chunk
+                    ],
                 ):
                     if streaming:
                         self._clear_audio_tail_locked()
@@ -407,6 +488,7 @@ class BaseAvatar:
             if streaming:
                 self._audio_start_pending = start_pending
                 self._audio_tail = remainder.astype(np.float32, copy=True)
+                self._audio_tail_rate = source_rate
                 self._audio_tail_generation = generation
                 self._audio_tail_turn_id = (
                     None if turn_id is None else str(turn_id)
@@ -429,7 +511,11 @@ class BaseAvatar:
             if not self._accept_generation_locked(generation):
                 return False
 
-        stream = self.__create_bytes_stream(filepath)
+        stream, source_rate = self.__create_bytes_stream(filepath)
+        stream = self._resample_exact(
+            stream, source_rate, self.sample_rate,
+            round(stream.size * self.sample_rate / source_rate),
+        )
         streamlen = stream.shape[0]
         idx = 0
         first = True
@@ -477,6 +563,14 @@ class BaseAvatar:
         return max(1, round(self.chunk * 1000 / self.sample_rate))
     
     def __create_bytes_stream(self, byte_stream):
+        """Decode to mono float32 at the *source* rate.
+
+        Resampling is deliberately left to the caller: ``put_audio_file``
+        needs one 20ms-aligned source buffer to derive both the 16kHz feature
+        stream and the output stream from, so that their frame counts cannot
+        drift apart.
+        """
+
         stream, sample_rate = sf.read(byte_stream) # [T*sample_rate,] float64
         logger.info(f'[INFO]put audio stream {sample_rate}: {stream.shape}')
         stream = stream.astype(np.float32)
@@ -484,12 +578,46 @@ class BaseAvatar:
         if stream.ndim > 1:
             logger.info(f'[WARN] audio has {stream.shape[1]} channels, only use the first.')
             stream = stream[:, 0]
-    
-        if sample_rate != self.sample_rate and stream.shape[0] > 0:
-            logger.info(f'[WARN] audio sample rate is {sample_rate}, resampling into {self.sample_rate}.')
-            stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=self.sample_rate)
 
-        return stream
+        return stream, int(sample_rate)
+
+    @staticmethod
+    def _resample_exact(samples, source_rate: int, target_rate: int, expected: int):
+        """Resample to an exact sample count.
+
+        resampy rounds its output length, but the 20ms frame contract needs
+        exactly ``expected`` samples or the feature and output streams stop
+        lining up frame for frame.
+        """
+
+        if source_rate == target_rate or samples.size == 0:
+            resampled = samples
+        else:
+            resampled = resampy.resample(
+                x=samples, sr_orig=source_rate, sr_new=target_rate
+            )
+        if resampled.size > expected:
+            resampled = resampled[:expected]
+        elif resampled.size < expected:
+            resampled = np.pad(resampled, (0, expected - resampled.size))
+        return np.asarray(resampled, dtype=np.float32)
+
+    def _to_output_rate(self, samples):
+        """Lift a feature-rate frame to the output rate.
+
+        Only legacy producers land here: LiveTalking's built-in TTS plugins
+        push 16kHz frames straight into ``put_audio_frame``, and the silence
+        and custom-audio paths synthesise them. Silence is by far the common
+        case and needs no filter at all.
+        """
+
+        if self.output_sample_rate == self.sample_rate:
+            return samples
+        if not samples.any():
+            return np.zeros(self.output_chunk, dtype=np.float32)
+        return self._resample_exact(
+            samples, self.sample_rate, self.output_sample_rate, self.output_chunk
+        )
 
     def flush_talk(self, generation: int | None = None):
         """Invalidate a turn and clear the complete audio/video pipeline."""
@@ -565,7 +693,7 @@ class BaseAvatar:
                     '-y', '-vn',
                     '-f', 's16le',
                     '-ac', '1',
-                    '-ar', '16000',
+                    '-ar', str(self.output_sample_rate),
                     '-i', '-',
                     '-acodec', 'aac',
                     f'temp{self.opt.sessionid}.aac']
@@ -659,9 +787,99 @@ class BaseAvatar:
             raise TypeError(f"Unsupported avatar video frame type: {type(frame).__name__}")
         return array.copy()
         
+    def render_snapshot(self) -> dict:
+        """Report what the renderer actually did, for probes and diagnostics.
+
+        ``held_frames`` is the count the outside world cannot measure: a
+        stride wider than 1 emits several video frames per model call, and box
+        jitter makes those repeats non-identical at the pixel level. Only the
+        renderer knows how many frames reused a pose.
+        """
+
+        inferences = self._inference_samples
+        speaking = self._speaking_frames
+        return {
+            "audio_output_rate": self.output_sample_rate,
+            "audio_output_chunk": self.output_chunk,
+            "stride_mode": self.inference_stride_mode,
+            "stride_limit": self.inference_stride,
+            "active_stride": self._active_stride,
+            "inference_ms_avg": round(self._inference_ema_sec * 1000.0, 2),
+            "inferences": inferences,
+            "speaking_frames": speaking,
+            "held_frames": max(0, speaking - inferences),
+            "held_ratio": (
+                round(max(0, speaking - inferences) / speaking, 4)
+                if speaking else None
+            ),
+        }
+
+    def _advance_idle_index(self, index: int, carry: float) -> tuple[int, float]:
+        """Step the idle loop, carrying the fraction so it cannot drift.
+
+        The carry keeps a scale like 1/3 landing on exactly one source frame
+        per three output frames over any run length. It is also the blend
+        weight toward the next source frame: simply repeating a frame would
+        keep every step's full size and just space the steps out, trading a
+        fast small motion for a slower lurching one.
+        """
+
+        carry += self.idle_motion_scale
+        step = int(carry)
+        return index + step, carry - step
+
+    def _observe_inference(self, elapsed: float) -> None:
+        """Retune the adaptive stride from measured inference latency.
+
+        The controller is deliberately reactive rather than predictive: the
+        only thing that matters is whether the model is currently keeping up
+        with the 25-fps deadline, and that is exactly what ``elapsed``
+        measures.  GPU contention from MLX TTS/ASR or llama.cpp shows up here
+        directly.
+        """
+
+        self._inference_samples += 1
+        if self._inference_samples == 1:
+            # The first inference on this thread pays a one-time Metal
+            # pipeline compile — measured at 1122ms against a 13.6ms steady
+            # state. Seeding the EMA with it costs ~18 frames of needlessly
+            # widened stride at the start of the first utterance, so the
+            # warm-up sample is discarded rather than smoothed.
+            logger.info("discarding cold-start inference sample (%.1fms)",
+                        elapsed * 1000.0)
+            return
+        if self._inference_ema_sec == 0.0:
+            self._inference_ema_sec = elapsed
+        else:
+            self._inference_ema_sec = (
+                _STRIDE_EMA_ALPHA * elapsed
+                + (1.0 - _STRIDE_EMA_ALPHA) * self._inference_ema_sec
+            )
+        # The average is telemetry in both modes; only the decision below is
+        # adaptive-only, so a fixed-stride A/B still reports its own latency.
+        if self.inference_stride_mode != "adaptive":
+            return
+
+        budget = 1.0 / max(1, int(getattr(self.opt, "fps", 25)))
+        needed = math.ceil(self._inference_ema_sec * _STRIDE_SAFETY / budget)
+        target = max(1, min(self.inference_stride, needed))
+        if target != self._active_stride:
+            logger.info(
+                "adaptive stride %d -> %d (inference %.1fms now, %.1fms avg, "
+                "frame budget %.1fms)",
+                self._active_stride,
+                target,
+                elapsed * 1000.0,
+                self._inference_ema_sec * 1000.0,
+                budget * 1000.0,
+            )
+            self._active_stride = target
+
     def inference(self, quit_event):
         length = self.get_avatar_length()
         index = 0
+        # Fractional carry for a slowed idle loop; speaking always steps by 1.
+        idle_carry = 0.0
         count = 0
         counttime = 0
         last_speaking = False
@@ -691,6 +909,7 @@ class BaseAvatar:
             t = time.perf_counter()
             pred = self.inference_batch(index + representative, audiofeat_batch)
             elapsed = time.perf_counter() - t
+            self._observe_inference(elapsed)
             counttime += elapsed
             count += len(pred)
             if count >= 100:
@@ -755,23 +974,35 @@ class BaseAvatar:
                 flush_speaking_group()
                 for i in range(self.batch_size):
                     idx = mirror_index(length, index)
+                    blend = (
+                        (mirror_index(length, index + 1), idle_carry)
+                        if idle_carry > 1e-6
+                        else None
+                    )
                     if not self._put_result_frame(
-                        (generation, None, audio_frames[i*2:i*2+2], idx), generation
+                        (generation, None, audio_frames[i*2:i*2+2], idx, blend),
+                        generation,
                     ):
                         break
-                    index = index + 1
+                    index, idle_carry = self._advance_idle_index(index, idle_carry)
             else:
                 if current_speaking and not last_speaking and self.custom_index.get(1) is not None: #从静音到说话切换,并且有自定义静态视频
                     index = 0
-                if self.inference_stride > 1:
+                if self._active_stride > 1:
                     speaking_group.append((generation, audiofeat_batch, audio_frames))
-                    if len(speaking_group) >= self.inference_stride:
+                    if len(speaking_group) >= self._active_stride:
                         flush_speaking_group()
                 else:
+                    # A stride that narrowed mid-utterance can leave a partial
+                    # group buffered.  Emit it before this frame so audio keeps
+                    # leaving the loop in arrival order.
+                    flush_speaking_group()
                     t = time.perf_counter()
                     pred = self.inference_batch(index, audiofeat_batch)
 
-                    counttime += (time.perf_counter() - t)
+                    elapsed = time.perf_counter() - t
+                    self._observe_inference(elapsed)
+                    counttime += elapsed
                     count += self.batch_size
                     if count >= 100:
                         logger.info(f"------actual avg infer fps:{count/counttime:.4f}")
@@ -818,7 +1049,10 @@ class BaseAvatar:
             except queue.Empty:
                 continue
 
-            if len(result_item) == 4:
+            idle_blend = None
+            if len(result_item) == 5:
+                generation, res_frame, audio_frames, idx, idle_blend = result_item
+            elif len(result_item) == 4:
                 generation, res_frame, audio_frames, idx = result_item
             else:
                 # Backward compatibility for an external producer using the
@@ -845,6 +1079,18 @@ class BaseAvatar:
                 else:
                     target_frame = self.frame_list_cycle[idx]
                 target_frame = self._materialize_video_frame(target_frame)
+                if idle_blend is not None:
+                    # Cross-fade toward the next source frame so a slowed idle
+                    # loop moves slowly rather than in held steps.
+                    next_idx, weight = idle_blend
+                    target_frame = blend_bgr(
+                        target_frame,
+                        1.0 - weight,
+                        self._materialize_video_frame(
+                            self.frame_list_cycle[next_idx]
+                        ),
+                        weight,
+                    )
                 
                 if enable_transition:
                     # 说话→静音过渡
@@ -861,6 +1107,7 @@ class BaseAvatar:
                     combine_frame = target_frame
             else:
                 self.speaking = True
+                self._speaking_frames += 1
                 try:
                     current_frame = self.paste_back_frame(res_frame,idx)
                 except Exception as e:
@@ -882,7 +1129,8 @@ class BaseAvatar:
 
             if not self._generation_is_current(generation):
                 continue
-            combine_frame = draw_debug_label_bgr(combine_frame)
+            if self.debug_label:
+                combine_frame = draw_debug_label_bgr(combine_frame)
             
             # 使用统一输出接口推送视频帧
             player = getattr(self.output, "_player", None)
@@ -896,7 +1144,19 @@ class BaseAvatar:
                 if not self._generation_is_current(generation):
                     break
                 #frame,type,eventpoint = audio_frame
-                frame = (audio_frame.data * 32767).astype(np.int16)
+                samples = audio_frame.output
+                if samples is None:
+                    samples = self._to_output_rate(audio_frame.data)
+                if not self._audio_push_logged:
+                    self._audio_push_logged = True
+                    logger.info(
+                        "first audio frame out: %d samples @ %dHz (source span "
+                        "%s, feature span %d)",
+                        samples.size, self.output_sample_rate,
+                        "carried" if audio_frame.output is not None else "lifted",
+                        audio_frame.data.size,
+                    )
+                frame = (samples * 32767).astype(np.int16)
 
                 # 使用统一输出接口推送音频帧
                 self.output.push_audio_frame(frame, audio_frame.userdata)

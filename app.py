@@ -161,6 +161,11 @@ def main():
         global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id)
         warm_up(opt.batch_size,global_avatars[opt.avatar_id],160)
 
+    # Encoder ceilings must be raised before the first peer connection builds
+    # its encoder, which reads aiortc's module-level bitrate defaults.
+    from server.codec_tuning import apply_webrtc_bitrate
+    apply_webrtc_bitrate(opt.video_bitrate, opt.video_max_bitrate)
+
     # init rtc manager
     session_manager.set_max_session(opt.max_session)
     session_manager.init_builder(build_avatar_session)

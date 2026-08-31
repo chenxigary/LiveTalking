@@ -1,3 +1,4 @@
+from functools import lru_cache
 from io import BytesIO
 
 import numpy as np
@@ -49,6 +50,77 @@ def resize_bgr(
     rgb = np.ascontiguousarray(np.asarray(frame, dtype=np.uint8)[..., ::-1])
     resized = Image.fromarray(rgb).resize(size, resize_filter)
     return _rgb_to_bgr(np.asarray(resized, dtype=np.uint8))
+
+
+@lru_cache(maxsize=256)
+def _lower_face_alpha(
+    height: int, width: int, split: float, feather: int, edge: int
+) -> np.ndarray:
+    """Build the read-only alpha mask used to composite a regenerated mouth.
+
+    Lip-sync models rebuild the whole face crop even though only the masked
+    lower half carries new information, so pasting the full crop back also
+    replaces sharp eye/hair pixels with a softer reconstruction.  The mask is
+    zero above ``split``, ramps to one over ``feather`` rows, and fades out
+    again over ``edge`` pixels at the left/right/bottom borders so the crop
+    boundary does not read as a rectangle.
+
+    Frame-to-frame box sizes barely move, so caching keeps this off the
+    25-fps render path entirely.
+    """
+
+    alpha = np.zeros((height, width, 1), dtype=np.float32)
+    mid = min(height, max(0, int(round(height * split))))
+    ramp_end = min(height, mid + max(0, feather))
+    alpha[ramp_end:] = 1.0
+    if ramp_end > mid:
+        alpha[mid:ramp_end, :, 0] = np.linspace(
+            0.0, 1.0, ramp_end - mid, dtype=np.float32
+        )[:, None]
+
+    edge = max(0, min(edge, width // 2, height // 2))
+    if edge:
+        ramp = np.linspace(0.0, 1.0, edge, dtype=np.float32)
+        alpha[:, :edge] *= ramp[None, :, None]
+        alpha[:, width - edge:] *= ramp[::-1][None, :, None]
+        alpha[height - edge:, :] *= ramp[::-1][:, None, None]
+
+    alpha.setflags(write=False)
+    return alpha
+
+
+def blend_lower_face_bgr(
+    canvas: np.ndarray,
+    patch: np.ndarray,
+    box: tuple[int, int, int, int],
+    *,
+    split: float = 0.5,
+    feather: int = 24,
+    edge: int = 12,
+    resample: str = "lanczos",
+) -> np.ndarray:
+    """Composite only the regenerated lower face of ``patch`` into ``canvas``.
+
+    ``box`` is LiveTalking's ``(y1, y2, x1, x2)`` face rectangle.  ``canvas``
+    is modified in place and returned.  Rows above the blend line are never
+    touched, which is both the point of this function and why it costs about
+    half of a full-crop paste.
+    """
+
+    y1, y2, x1, x2 = box
+    height, width = y2 - y1, x2 - x1
+    if height <= 0 or width <= 0:
+        return canvas
+
+    resized = resize_bgr(patch, (width, height), resample=resample)
+    alpha = _lower_face_alpha(height, width, split, feather, edge)
+    mid = min(height, max(0, int(round(height * split))))
+
+    region = canvas[y1 + mid:y2, x1:x2]
+    weight = alpha[mid:]
+    blended = region * (1.0 - weight) + resized[mid:] * weight
+    canvas[y1 + mid:y2, x1:x2] = np.rint(blended).astype(np.uint8)
+    return canvas
 
 
 def blend_bgr(

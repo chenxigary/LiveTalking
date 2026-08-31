@@ -52,7 +52,7 @@ class VirtualCamOutput(BaseOutput):
                 logger.warning("[VirtualCam Audio] Cannot get default output device, using system default")
 
         stream = p.open(
-            rate=16000,
+            rate=getattr(self.opt, 'audio_output_rate', 16000),
             channels=1,
             format=8,
             output=True,

@@ -40,7 +40,13 @@ from avatars.base_avatar import BaseAvatar
 
 from tqdm import tqdm
 from utils.logger import logger
-from utils.image import decode_bgr, read_imgs, mirror_index, resize_bgr
+from utils.image import (
+    blend_lower_face_bgr,
+    decode_bgr,
+    read_imgs,
+    mirror_index,
+    resize_bgr,
+)
 from utils.device import initialize_device
 from registry import register
 
@@ -140,6 +146,24 @@ class LipReal(BaseAvatar):
 
         self.frame_list_cycle,self.face_list_cycle,self.coord_list_cycle = avatar
 
+        # Wav2Lip only conditions the masked lower half on audio, but its
+        # decoder still rebuilds the entire crop.  "lower" composites just that
+        # half back and leaves the eyes/hair at source sharpness; "full" keeps
+        # the upstream whole-crop paste for A/B comparison.
+        self.paste_back_mode = str(
+            getattr(opt, "paste_back_mode", "lower")
+        ).strip().lower()
+        if self.paste_back_mode not in {"lower", "full"}:
+            raise ValueError("paste_back_mode must be 'lower' or 'full'")
+        self.paste_back_feather = max(0, int(getattr(opt, "paste_back_feather", 24)))
+        self.paste_back_edge = max(0, int(getattr(opt, "paste_back_edge", 12)))
+        logger.info(
+            "wav2lip paste-back: mode=%s feather=%d edge=%d",
+            self.paste_back_mode,
+            self.paste_back_feather,
+            self.paste_back_edge,
+        )
+
         self.asr = MelASR(opt,self)
         self.asr.warm_up()
     
@@ -176,9 +200,17 @@ class LipReal(BaseAvatar):
         else:
             combine_frame = raw_frame.copy()
 
+        patch = pred_frame.astype(np.uint8)
+        if self.paste_back_mode == "lower":
+            return blend_lower_face_bgr(
+                combine_frame,
+                patch,
+                bbox,
+                feather=self.paste_back_feather,
+                edge=self.paste_back_edge,
+            )
+
         y1, y2, x1, x2 = bbox
-        res_frame = resize_bgr(
-            pred_frame.astype(np.uint8), (x2 - x1, y2 - y1)
-        )
+        res_frame = resize_bgr(patch, (x2 - x1, y2 - y1))
         combine_frame[y1:y2, x1:x2] = res_frame
         return combine_frame

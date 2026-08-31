@@ -363,6 +363,8 @@ async def admin_sessions(request):
                         "batch_size": getattr(s_opt, "batch_size", 0),
                         "customopt": getattr(s_opt, "customopt", []),
                     })
+                if hasattr(avatar_session, "render_snapshot"):
+                    s_data["render"] = avatar_session.render_snapshot()
                 sessions_info.append(s_data)
         return json_ok(data={"sessions": sessions_info})
     except Exception as e:

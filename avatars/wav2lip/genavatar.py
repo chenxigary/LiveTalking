@@ -23,7 +23,11 @@ def video2imgs(vid_path, save_path, ext = '.png', cut_frame = 10000000):
             break
         ret, frame = cap.read()
         if ret:
-            cv2.putText(frame, "LiveTalking", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (128,128,128), 1)
+            # Upstream burned a "LiveTalking" watermark into every extracted
+            # frame here.  It is permanent — it survives into the served video
+            # because these PNGs are the render background — and the runtime
+            # already has an optional overlay (--debug_label) for the same
+            # purpose, so the source frames stay clean.
             cv2.imwrite(f"{save_path}/{count:08d}.png", frame)
             count += 1
         else:
@@ -39,9 +43,12 @@ def get_smoothened_boxes(boxes, T):
         boxes[i] = np.mean(window, axis=0)
     return boxes
 
-def generate_avatar(video_path, avatar_id, save_path='./data/avatars', img_size=256, pads=[0, 10, 0, 0], nosmooth=False, face_det_batch_size=8, progress_callback=None):
-    """
-    生成avatar的核心逻辑（超快内存流式版 — 640px 缩放检测，零内存负担，18x 加速）
+def generate_avatar(video_path, avatar_id, save_path='./data/avatars', img_size=256, pads=[0, 10, 0, 0], nosmooth=False, face_det_batch_size=8, det_size=640, progress_callback=None):
+    """生成 avatar 的核心逻辑（内存流式，人脸检测按等比 letterbox 缩放）。
+
+    ``det_size`` 是送入 S3FD 的方形画布边长；设为 0 表示按原始分辨率检测，
+    精度最高但最慢。无论哪种方式，缩放都保持长宽比——把非方形帧直接压成
+    正方形会让检测框在映射回原图后按同样比例失真。
     """
     avatar_path = os.path.join(save_path, avatar_id)
     full_imgs_path = os.path.join(avatar_path, "full_imgs")
@@ -59,7 +66,6 @@ def generate_avatar(video_path, avatar_id, save_path='./data/avatars', img_size=
         input_img_list = sorted(glob(os.path.join(full_imgs_path, '*.[jpJP][pnPN]*[gG]')))
 
     total_frames = len(input_img_list)
-    print(f"共发现 {total_frames} 帧图片，使用 640px 快速流式人脸检测...")
 
     if progress_callback: progress_callback(20)
 
@@ -77,18 +83,32 @@ def generate_avatar(video_path, avatar_id, save_path='./data/avatars', img_size=
     orig_h, orig_w = first_frame.shape[:2]
     del first_frame
 
-    target_size = 640
-    scale_w = target_size / float(orig_w)
-    scale_h = target_size / float(orig_h)
+    # 等比 letterbox：一个 scale 同时作用于两个轴，检测框换算回原图时不失真。
+    # 早期实现用 cv2.resize(img, (640, 640)) 把 704x896 压成正方形，纵向比横向
+    # 多压 27%，映射回来的每个框都因此偏高，Wav2Lip 拿到的人脸裁剪远非方形。
+    if det_size and det_size > 0:
+        scale = min(det_size / float(orig_w), det_size / float(orig_h))
+        det_w, det_h = int(round(orig_w * scale)), int(round(orig_h * scale))
+        pad_x, pad_y = (det_size - det_w) // 2, (det_size - det_h) // 2
+        print(f"共发现 {total_frames} 帧图片，按 {det_size}px letterbox 检测人脸"
+              f"（{det_w}x{det_h}，缩放 {scale:.3f}）...")
+    else:
+        scale, det_w, det_h, pad_x, pad_y = 1.0, orig_w, orig_h, 0, 0
+        print(f"共发现 {total_frames} 帧图片，按原始分辨率 {orig_w}x{orig_h} 检测人脸...")
 
-    # 18x 快速流式检测 (缩放到 640px 运行 S3FD，再换算回原图尺寸)
     for i in tqdm(range(0, total_frames, batch_size), desc="流式人脸检测"):
         batch_paths = input_img_list[i : i + batch_size]
         batch_resized = []
         for p in batch_paths:
             img = cv2.imread(p)
-            resized = cv2.resize(img, (target_size, target_size))
-            batch_resized.append(resized)
+            if scale == 1.0:
+                batch_resized.append(img)
+                continue
+            canvas = np.zeros((det_size, det_size, 3), dtype=img.dtype)
+            canvas[pad_y:pad_y + det_h, pad_x:pad_x + det_w] = cv2.resize(
+                img, (det_w, det_h)
+            )
+            batch_resized.append(canvas)
             del img
 
         preds = detector.get_detections_for_batch(np.asarray(batch_resized))
@@ -99,10 +119,10 @@ def generate_avatar(video_path, avatar_id, save_path='./data/avatars', img_size=
                 predictions.append(None)
             else:
                 x1, y1, x2, y2 = pred
-                orig_x1 = int(x1 / scale_w)
-                orig_y1 = int(y1 / scale_h)
-                orig_x2 = int(x2 / scale_w)
-                orig_y2 = int(y2 / scale_h)
+                orig_x1 = max(0, min(orig_w, int(round((x1 - pad_x) / scale))))
+                orig_y1 = max(0, min(orig_h, int(round((y1 - pad_y) / scale))))
+                orig_x2 = max(0, min(orig_w, int(round((x2 - pad_x) / scale))))
+                orig_y2 = max(0, min(orig_h, int(round((y2 - pad_y) / scale))))
                 predictions.append((orig_x1, orig_y1, orig_x2, orig_y2))
 
         del batch_resized
@@ -167,6 +187,8 @@ if __name__ == '__main__':
     parser.add_argument('--nosmooth', default=False, action='store_true')
     parser.add_argument('--pads', nargs='+', type=int, default=[0, 10, 0, 0])
     parser.add_argument('--face_det_batch_size', type=int, default=8)
+    parser.add_argument('--det_size', default=640, type=int,
+                        help='人脸检测方形画布边长；0 表示按原始分辨率检测')
     args = parser.parse_args()
 
     generate_avatar(
@@ -177,4 +199,5 @@ if __name__ == '__main__':
         pads=args.pads,
         nosmooth=args.nosmooth,
         face_det_batch_size=args.face_det_batch_size,
+        det_size=args.det_size,
     )
