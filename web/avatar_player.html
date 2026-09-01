@@ -27,9 +27,18 @@
             background: #0b0d12;
         }
         video {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
+            /* --avatar-scale shrinks the rendered person inside the stage
+               without re-cutting the source. object-fit stays "contain" so
+               scaling down reveals the whole frame instead of a tighter crop:
+               with "cover" a narrower box just zooms further into the face,
+               which is the opposite of what a smaller scale is asked for. */
+            width: var(--avatar-scale, 100%);
+            height: var(--avatar-scale, 100%);
+            /* Hug the right edge like the reference layout: below 100% the
+               freed space becomes dark canvas on the left, next to the
+               conversation column, rather than a symmetric letterbox. */
+            margin: auto 0 auto auto;
+            object-fit: contain;
             object-position: center top;
             background: #000;
         }
@@ -126,6 +135,19 @@
          parent can switch it back to muted direct_audio as a fallback. -->
     <audio id="audio" autoplay="true" playsinline="true" muted></audio>
     <video id="video" autoplay="true" playsinline="true" muted></video>
+    <script>
+        // ?avatar_scale=80 renders the person at 80% of the stage. Kept in the
+        // URL rather than a build-time constant so framing can be dialled in
+        // against a running session.
+        (function () {
+            const raw = new URLSearchParams(location.search).get('avatar_scale');
+            const pct = Number(raw);
+            if (Number.isFinite(pct) && pct >= 20 && pct <= 100) {
+                document.documentElement.style.setProperty(
+                    '--avatar-scale', pct + '%');
+            }
+        })();
+    </script>
 </div>
 
 <script src="client.js?v=8"></script>
